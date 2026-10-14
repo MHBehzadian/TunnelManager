@@ -1,18 +1,23 @@
 """Everything that touches BackPack on the servers: config rendering, deploy,
-install, and the end-to-end health probe.
+install, scanning for existing tunnels, and the health checks.
 
-Each link (Iran x kharej pair) is one BackPack reverse tunnel named
-``tm-<link id>``. Its files follow BackPack's own layout so the tunnels also
-show up in BackPack's CLI and web panel:
+A link's files follow BackPack's own layout, so every tunnel also shows up
+in BackPack's CLI and web panel:
 
-    /etc/backpack/tm-<id>.toml                 config
-    /etc/backpack/tm-<id>.metrics.json         written by the engine
-    /etc/systemd/system/backpack-tm-<id>.service
+    /etc/backpack/<name>.toml                 config
+    /etc/backpack/<name>.metrics.json         written by the engine
+    /etc/systemd/system/backpack-<name>.service
 
-Health is checked end to end: the Iran side of every tunnel also exposes a
+Tunnels the panel builds are named ``tm-<link id>``. Tunnels it *adopts*
+(found already running) keep their names, and every key in their config the
+panel does not manage is preserved when it rewrites them.
+
+Health is checked end to end where possible: the Iran side of a tunnel gets a
 loopback-only *probe port* mapped to the kharej's sshd (``127.0.0.1:61000 =
-127.0.0.1:22``). Reading ``SSH-`` from that port on the Iran server proves
-the whole path — listener, tunnel, kharej client, last hop — works.
+127.0.0.1:22``), and reading ``SSH-`` from it on the Iran server proves the
+whole path works. An adopted tunnel has no probe until the panel first
+rewrites its config; until then the engine's own report (``connected`` in
+its metrics file) or an established connection on the tunnel port is used.
 """
 
 from __future__ import annotations
@@ -25,12 +30,14 @@ import re
 import shlex
 import statistics
 import tarfile
-from dataclasses import dataclass
+import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 
-from .models import Link, Server
+from .models import TCP_TRANSPORTS, Link, Server
 from .ssh import SSHError, SSHPool
 
 log = logging.getLogger(__name__)
@@ -52,6 +59,8 @@ ARCH = {
 }
 
 _SAFE = re.compile(r"^[A-Za-z0-9_.:\-=|,\[\]]+$")
+_NAME = re.compile(r"^[A-Za-z0-9_.\-]+$")
+PROBE_RE = re.compile(r"^127\.0\.0\.1:(\d+)=127\.0\.0\.1:\d+$")
 
 
 class DeployError(Exception):
@@ -65,11 +74,38 @@ class Probe:
     active: str = ""
     connected: bool | None = None
     connect_s: float | None = None
+    verified: bool = True
     error: str = ""
 
 
-def q(s: str) -> str:
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+@dataclass
+class Found:
+    """A tunnel config found on a server by scan()."""
+
+    name: str
+    role: str  # server | client
+    data: dict[str, Any]
+    active: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def transport(self) -> str:
+        return str(self.data.get("transport", "tcp"))
+
+    @property
+    def token(self) -> str:
+        return str(self.data.get("token") or "backpack")  # BackPack's built-in default
+
+    def port(self) -> int | None:
+        addr = str(self.data.get("bind_addr" if self.role == "server" else "remote_addr", ""))
+        try:
+            return int(addr.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
+    def host(self) -> str:
+        addr = str(self.data.get("bind_addr" if self.role == "server" else "remote_addr", ""))
+        return addr.rsplit(":", 1)[0].strip("[]") if ":" in addr else ""
 
 
 def validate_port_mapping(p: str) -> str:
@@ -79,55 +115,104 @@ def validate_port_mapping(p: str) -> str:
     return p
 
 
-def unit_name(link: Link) -> str:
-    return f"backpack-{link.service}.service"
+def split_ports(ports: list[str]) -> tuple[list[str], int]:
+    """Separate the panel's probe mapping from the user's ports."""
+    probe, out = 0, []
+    for p in ports:
+        m = PROBE_RE.match(p.strip())
+        if m and int(m.group(1)) >= 1024 and not probe:
+            probe = int(m.group(1))
+        else:
+            out.append(p)
+    return out, probe
 
 
-def conf_path(link: Link) -> str:
-    return f"{CONF_DIR}/{link.service}.toml"
+# ---------------------------------------------------------------- TOML out
+def _toml_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+    if isinstance(v, list):
+        if not v:
+            return "[]"
+        return "[\n" + "".join(f"    {_toml_value(x)},\n" for x in v) + "]"
+    raise TypeError(f"cannot write {type(v).__name__} to TOML")
+
+
+def dump_section(name: str, data: dict[str, Any], header: str = "") -> str:
+    lines = [header] if header else []
+    lines.append(f"[{name}]")
+    subs = []
+    for k, v in data.items():
+        if isinstance(v, dict):
+            subs.append((k, v))
+        else:
+            lines.append(f"{k} = {_toml_value(v)}")
+    out = "\n".join(lines) + "\n"
+    for k, v in subs:
+        out += "\n" + dump_section(f"{name}.{k}", v)
+    return out
+
+
+def q(s: str) -> str:
+    return _toml_value(s)
+
+
+# ------------------------------------------------------------ rendering
+def server_section(link: Link, transport: str, ports: list[str], kharej: Server) -> dict[str, Any]:
+    d = dict(link.iran_base)
+    host = str(d.get("bind_addr", "0.0.0.0:0")).rsplit(":", 1)[0] or "0.0.0.0"
+    d["bind_addr"] = f"{host}:{link.tunnel_port}"
+    d["transport"] = transport
+    d["token"] = link.token
+    d["accept_udp"] = bool(link.accept_udp)
+    d.setdefault("log_level", "info")
+    probe = [f"127.0.0.1:{link.probe_port}={kharej.probe_addr()}"] if link.probe_port else []
+    d["ports"] = probe + list(ports)
+    return d
+
+
+def client_section(link: Link, transport: str, iran: Server) -> dict[str, Any]:
+    d = dict(link.kharej_base)
+    base_host = str(d.get("remote_addr", "")).rsplit(":", 1)[0] if ":" in str(d.get("remote_addr", "")) else ""
+    host = base_host or (f"[{iran.ip}]" if ":" in iran.ip else iran.ip)
+    d["remote_addr"] = f"{host}:{link.tunnel_port}"
+    d["transport"] = transport
+    d["token"] = link.token
+    d.setdefault("connection_pool", 8)
+    d.setdefault("log_level", "info")
+    return d
 
 
 def render_server(link: Link, transport: str, ports: list[str], kharej: Server) -> str:
-    all_ports = [f"127.0.0.1:{link.probe_port}={kharej.probe_addr()}"] + list(ports)
-    lines = [
-        "# Managed by TunnelManager - changes here are overwritten.",
-        f"# link {link.id}: kharej {kharej.name} -> this Iran server",
-        "[server]",
-        f'bind_addr = "0.0.0.0:{link.tunnel_port}"',
-        f"transport = {q(transport)}",
-        f"token = {q(link.token)}",
-        f"accept_udp = {'true' if kharej.accept_udp else 'false'}",
-        'log_level = "info"',
-        "ports = [",
-        *[f"    {q(p)}," for p in all_ports],
-        "]",
-    ]
-    return "\n".join(lines) + "\n"
+    head = f"# Managed by TunnelManager (link {link.id}) - kharej {kharej.name} -> this Iran server"
+    return dump_section("server", server_section(link, transport, ports, kharej), head)
 
 
 def render_client(link: Link, transport: str, iran: Server) -> str:
-    host = f"[{iran.ip}]" if ":" in iran.ip else iran.ip
-    lines = [
-        "# Managed by TunnelManager - changes here are overwritten.",
-        f"# link {link.id}: this kharej server -> Iran {iran.name}",
-        "[client]",
-        f'remote_addr = "{host}:{link.tunnel_port}"',
-        f"transport = {q(transport)}",
-        f"token = {q(link.token)}",
-        "connection_pool = 8",
-        'log_level = "info"',
-    ]
-    return "\n".join(lines) + "\n"
+    head = f"# Managed by TunnelManager (link {link.id}) - this kharej server -> Iran {iran.name}"
+    return dump_section("client", client_section(link, transport, iran), head)
 
 
-def render_unit(link: Link) -> str:
+def unit_name(name: str) -> str:
+    return f"backpack-{name}.service"
+
+
+def conf_path(name: str) -> str:
+    return f"{CONF_DIR}/{name}.toml"
+
+
+def render_unit(name: str) -> str:
     return f"""[Unit]
-Description=Backpack Tunnel ({link.service}) - managed by TunnelManager
+Description=Backpack Tunnel ({name})
 After=network.target
 
 [Service]
 Type=simple
-ExecStart={BIN_PATH} -c {conf_path(link)}
+ExecStart={BIN_PATH} -c {conf_path(name)}
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -137,42 +222,66 @@ WantedBy=multi-user.target
 """
 
 
+# ------------------------------------------------------------- scripts
 def _probe_snippet(port: int) -> str:
     # Opens the probe port and reads the first bytes the far end sends.
     return f"timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}; head -c 4 <&3' 2>/dev/null"
 
 
 def check_script(links: list[Link]) -> str:
-    """One round trip per Iran server: unit state, engine's own view, and an
-    end-to-end probe for every link it hosts."""
+    """One round trip per Iran server: unit state, the engine's own view, an
+    end-to-end probe where the tunnel has one, and established connections
+    on the tunnel port (from /proc, no tools needed) as the last resort."""
     parts = []
     for x in links:
+        n = shlex.quote(x.iran_name)
+        if x.probe_port:
+            probe = f't0=$(date +%s%N); b=$({_probe_snippet(x.probe_port)}); t1=$(date +%s%N); p=$( [ -n "$b" ] && echo 1 || echo 0)'
+        else:
+            probe = "t0=0; t1=0; p=-"
         parts.append(
-            f"""n={x.service}; a=$(systemctl is-active backpack-$n.service 2>/dev/null)
-c=$(grep -o '"connected": *[a-z]*' {CONF_DIR}/$n.metrics.json 2>/dev/null | grep -o '[a-z]*$')
-t0=$(date +%s%N); b=$({_probe_snippet(x.probe_port)}); t1=$(date +%s%N)
-echo "@@{x.id}|$a|$c|$( [ -n "$b" ] && echo 1 || echo 0)|$(( (t1-t0)/1000 ))"
+            f"""a=$(systemctl is-active backpack-{n}.service 2>/dev/null)
+c=$(grep -o '"connected": *[a-z]*' {CONF_DIR}/{n}.metrics.json 2>/dev/null | grep -o '[a-z]*$')
+{probe}
+e=$(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '{{ split($2,a,":"); if (a[2]=="{x.tunnel_port:04X}" && $4=="01") n++ }} END {{ print n+0 }}')
+echo "@@{x.id}|$a|$c|$p|$(( (t1-t0)/1000 ))|$e"
 """
         )
     return "".join(parts)
 
 
-def parse_check(out: str) -> dict[str, Probe]:
+def parse_check(out: str, links: dict[str, Link] | None = None) -> dict[str, Probe]:
     res = {}
     for line in out.splitlines():
         if not line.startswith("@@"):
             continue
-        try:
-            lid, active, conn, ok, us = line[2:].split("|")
-        except ValueError:
+        parts = line[2:].split("|")
+        if len(parts) < 5:
             continue
-        good = ok == "1"
-        res[lid] = Probe(
-            ok=good,
-            active=active,
-            connected=None if conn == "" else conn == "true",
-            latency_ms=round(int(us) / 1000, 1) if good and us.isdigit() else None,
-        )
+        lid, active, conn, ok, us = parts[:5]
+        estab = int(parts[5]) if len(parts) > 5 and parts[5].strip().isdigit() else 0
+        connected = None if conn == "" else conn == "true"
+        if ok in ("0", "1"):
+            good = ok == "1"
+            res[lid] = Probe(
+                ok=good,
+                active=active,
+                connected=connected,
+                latency_ms=round(int(us) / 1000, 1) if good and us.isdigit() else None,
+            )
+            continue
+        # no probe port: infer from the engine, then from the socket table
+        link = (links or {}).get(lid)
+        tcp = link is None or link.transport in TCP_TRANSPORTS
+        if active != "active":
+            good = False
+        elif connected is not None:
+            good = connected
+        elif tcp:
+            good = estab > 0
+        else:
+            good = True  # a running datagram tunnel we cannot see into
+        res[lid] = Probe(ok=good, active=active, connected=connected, verified=False)
     return res
 
 
@@ -204,6 +313,40 @@ def parse_wait(out: str) -> Probe:
     return Probe(ok=True, latency_ms=round(statistics.median(lats), 1), connect_s=round(connect_ms / 1000, 2))
 
 
+SCAN_SCRIPT = f"""for f in {CONF_DIR}/*.toml; do
+  [ -f "$f" ] || continue
+  n=$(basename "$f" .toml)
+  echo "@@FILE $n $(systemctl is-active backpack-$n.service 2>/dev/null)"
+  head -c 65536 "$f"
+  echo
+done
+echo "@@END"
+"""
+
+
+def parse_scan(out: str) -> list[Found]:
+    """Reverse tunnels in a server's /etc/backpack. Direct/L3 tunnels and
+    anything unparsable are skipped."""
+    found: list[Found] = []
+    chunks = out.split("@@FILE ")[1:]
+    for chunk in chunks:
+        head, _, body = chunk.partition("\n")
+        body = body.split("@@END")[0]
+        name, _, active = head.strip().partition(" ")
+        if not _NAME.match(name):
+            continue
+        try:
+            data = tomllib.loads(body)
+        except tomllib.TOMLDecodeError:
+            log.info("scan: cannot parse %s", name)
+            continue
+        for role in ("server", "client"):
+            sec = data.get(role)
+            if isinstance(sec, dict) and sec.get("transport") != "spoof":
+                found.append(Found(name=name, role=role, data=sec, active=active.strip()))
+    return found
+
+
 def _ufw_allow(ports: list[str]) -> str:
     """Open ports on ufw if it is active. Mappings are reduced to their
     listening port (or range)."""
@@ -223,6 +366,7 @@ def _ufw_allow(ports: list[str]) -> str:
     return f"if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then {rules} fi\n"
 
 
+# --------------------------------------------------------------- drivers
 class Driver:
     """Abstract driver so the orchestrator can be tested without servers."""
 
@@ -234,6 +378,7 @@ class Driver:
     async def remove(self, link: Link, iran: Server | None, kharej: Server | None) -> None: ...
     async def check(self, iran: Server, links: list[Link]) -> dict[str, Probe]: ...
     async def wait_up(self, link: Link, iran: Server, timeout: int) -> Probe: ...
+    async def scan(self, s: Server) -> list[Found]: ...
 
 
 class SSHDriver(Driver):
@@ -299,14 +444,19 @@ class SSHDriver(Driver):
         return ver
 
     # ---- deploy --------------------------------------------------------
-    async def _install_side(self, s: Server, link: Link, toml: str, open_ports: list[str]) -> None:
+    async def _install_side(self, s: Server, name: str, toml: str, open_ports: list[str]) -> None:
+        if not _NAME.match(name):
+            raise DeployError(f"bad tunnel name {name!r}")
         await self.pool.run(s, f"mkdir -p {CONF_DIR} && chmod 700 {CONF_DIR}")
-        await self.pool.put(s, toml.encode(), conf_path(link), 0o600)
-        await self.pool.put(s, render_unit(link).encode(), f"{UNIT_DIR}/{unit_name(link)}", 0o644)
-        u = unit_name(link)
+        await self.pool.put(s, toml.encode(), conf_path(name), 0o600)
+        u = unit_name(name)
+        # keep an existing unit (adopted tunnels may have their own); write ours otherwise
+        r = await self.pool.run(s, f"test -f {UNIT_DIR}/{u} && echo yes || echo no", timeout=15)
+        if r.out.strip() != "yes":
+            await self.pool.put(s, render_unit(name).encode(), f"{UNIT_DIR}/{u}", 0o644)
         cmd = (
             _ufw_allow(open_ports)
-            + f"rm -f {CONF_DIR}/{link.service}.metrics.json; systemctl daemon-reload && "
+            + f"rm -f {CONF_DIR}/{name}.metrics.json; systemctl daemon-reload && "
             f"systemctl enable {u} >/dev/null 2>&1; systemctl restart {u}"
         )
         r = await self.pool.run(s, cmd, timeout=40)
@@ -316,40 +466,51 @@ class SSHDriver(Driver):
     async def deploy(self, link: Link, iran: Server, kharej: Server, transport: str, ports: list[str]) -> None:
         open_ports = [str(link.tunnel_port)] + ports
         await asyncio.gather(
-            self._install_side(iran, link, render_server(link, transport, ports, kharej), open_ports),
-            self._install_side(kharej, link, render_client(link, transport, iran), []),
+            self._install_side(iran, link.iran_name, render_server(link, transport, ports, kharej), open_ports),
+            self._install_side(kharej, link.kharej_name, render_client(link, transport, iran), []),
         )
 
     async def deploy_iran(self, link: Link, iran: Server, kharej: Server, ports: list[str]) -> None:
         await self._install_side(
-            iran, link, render_server(link, link.transport, ports, kharej), [str(link.tunnel_port)] + ports
+            iran,
+            link.iran_name,
+            render_server(link, link.transport, ports, kharej),
+            [str(link.tunnel_port)] + ports,
         )
 
-    async def _stop_side(self, s: Server | None, link: Link, purge: bool) -> None:
-        if s is None:
+    async def _stop_side(self, s: Server | None, name: str, purge: bool) -> None:
+        if s is None or not _NAME.match(name):
             return
-        u = unit_name(link)
+        u = unit_name(name)
         cmd = f"systemctl disable --now {u} >/dev/null 2>&1; true"
         if purge:
-            cmd += f"; rm -f {UNIT_DIR}/{u} {conf_path(link)} {CONF_DIR}/{link.service}.metrics.json; systemctl daemon-reload"
+            cmd += f"; rm -f {UNIT_DIR}/{u} {conf_path(name)} {CONF_DIR}/{name}.metrics.json; systemctl daemon-reload"
         try:
             await self.pool.run(s, cmd, timeout=30)
         except SSHError as e:
-            log.info("stop %s on %s: %s", link.service, s.name, e)
+            log.info("stop %s on %s: %s", name, s.name, e)
 
     async def stop(self, link: Link, iran: Server | None, kharej: Server | None) -> None:
-        await asyncio.gather(self._stop_side(iran, link, False), self._stop_side(kharej, link, False))
+        await asyncio.gather(
+            self._stop_side(iran, link.iran_name, False), self._stop_side(kharej, link.kharej_name, False)
+        )
 
     async def remove(self, link: Link, iran: Server | None, kharej: Server | None) -> None:
-        await asyncio.gather(self._stop_side(iran, link, True), self._stop_side(kharej, link, True))
+        await asyncio.gather(
+            self._stop_side(iran, link.iran_name, True), self._stop_side(kharej, link.kharej_name, True)
+        )
 
-    # ---- health --------------------------------------------------------
+    # ---- health / discovery -------------------------------------------
     async def check(self, iran: Server, links: list[Link]) -> dict[str, Probe]:
         if not links:
             return {}
         r = await self.pool.run(iran, check_script(links), timeout=10 + 4 * len(links))
-        return parse_check(r.out)
+        return parse_check(r.out, {x.id: x for x in links})
 
     async def wait_up(self, link: Link, iran: Server, timeout: int) -> Probe:
         r = await self.pool.run(iran, wait_script(link.probe_port, timeout), timeout=timeout + 40)
         return parse_wait(r.out)
+
+    async def scan(self, s: Server) -> list[Found]:
+        r = await self.pool.run(s, SCAN_SCRIPT, timeout=30)
+        return parse_scan(r.out)

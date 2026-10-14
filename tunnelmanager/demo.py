@@ -7,7 +7,7 @@ import asyncio
 import logging
 import random
 
-from .backpack import Driver, Probe
+from .backpack import Driver, Found, Probe
 from .models import IRAN, KHAREJ, DNSProvider, Domain, Server
 from .ssh import SSHError
 from .store import Store
@@ -17,7 +17,8 @@ log = logging.getLogger(__name__)
 
 class SimNet(Driver):
     """A simulated network: servers can die, transports can be blocked per
-    pair, and every transport has a latency."""
+    pair, paths can flap, and every transport has a latency. ``existing``
+    holds tunnels "already running" on servers, for scan() to find."""
 
     LAT = {"tcpmux": 40, "wsmux": 55, "tcp": 35, "ws": 60, "stealth": 50, "kcp": 70, "quic": 45}
 
@@ -25,23 +26,27 @@ class SimNet(Driver):
         self.jitter = jitter
         self.dead: set[str] = set()
         self.blocked: set[tuple[str, str, str]] = set()  # (iran, kharej, transport)
+        self.flaky: dict[tuple[str, str], float] = {}  # (iran, kharej) -> failure probability
         self.deployed: dict[str, str] = {}  # link id -> transport
         self.iran_ports: dict[str, list[str]] = {}  # link id -> ports on the Iran side
         self.stopped: set[str] = set()
+        self.existing: dict[str, list[Found]] = {}
         self.calls: list[tuple] = []
+        self.rnd = random.Random(1)
 
     def block(self, iran: Server, kharej: Server, *transports: str):
         for t in transports:
             self.blocked.add((iran.id, kharej.id, t))
 
     def works(self, link, transport: str | None = None) -> bool:
-        t = transport or self.deployed.get(link.id)
+        t = transport or self.deployed.get(link.id) or link.transport
         return (
-            t is not None
+            bool(t)
             and link.id not in self.stopped
             and link.iran_id not in self.dead
             and link.kharej_id not in self.dead
             and (link.iran_id, link.kharej_id, t) not in self.blocked
+            and self.rnd.random() >= self.flaky.get((link.iran_id, link.kharej_id), 0)
         )
 
     def lat(self, t, link=None) -> float:
@@ -50,7 +55,7 @@ class SimNet(Driver):
             return base
         # a stable per-pair, per-transport character, plus a little noise
         if link is not None:
-            base *= random.Random(f"{link.id}{t}").uniform(0.6, 2.2)
+            base *= random.Random(f"{link.iran_id}{link.kharej_id}{t}").uniform(0.6, 2.2)
         return round(base * random.uniform(0.9, 1.25), 1)
 
     async def ping(self, s):
@@ -61,7 +66,7 @@ class SimNet(Driver):
     async def ensure_installed(self, s, install=True):
         if s.id in self.dead:
             raise SSHError("down")
-        return "v-test"
+        return "v1.9.0"
 
     async def deploy(self, link, iran, kharej, transport, ports):
         if iran.id in self.dead:
@@ -72,6 +77,8 @@ class SimNet(Driver):
         self.stopped.discard(link.id)
 
     async def deploy_iran(self, link, iran, kharej, ports):
+        if iran.id in self.dead:
+            raise SSHError("iran down")
         self.calls.append(("deploy_iran", link.id, tuple(ports)))
         self.iran_ports[link.id] = list(ports)
         self.stopped.discard(link.id)
@@ -89,7 +96,8 @@ class SimNet(Driver):
         out = {}
         for x in links:
             ok = self.works(x)
-            out[x.id] = Probe(ok=ok, active="active", latency_ms=self.lat(self.deployed.get(x.id), x) if ok else None)
+            t = self.deployed.get(x.id) or x.transport
+            out[x.id] = Probe(ok=ok, active="active", latency_ms=self.lat(t, x) if ok else None, verified=bool(x.probe_port))
         return out
 
     async def wait_up(self, link, iran, timeout):
@@ -97,6 +105,25 @@ class SimNet(Driver):
         if self.works(link, t):
             return Probe(ok=True, latency_ms=self.lat(t, link), connect_s=round(random.uniform(0.6, 3.5), 2) if self.jitter else 1.0)
         return Probe(ok=False, error="timeout")
+
+    async def scan(self, s):
+        if s.id in self.dead:
+            raise SSHError("down")
+        return list(self.existing.get(s.id, []))
+
+    def plant(self, iran: Server, kharej: Server, name: str, transport: str, port: int, ports: list[str], token: str = "secret"):
+        """Pretend a tunnel was set up by hand before the panel existed."""
+        self.existing.setdefault(iran.id, []).append(
+            Found(name=name, role="server", active="active", data={
+                "bind_addr": f"0.0.0.0:{port}", "transport": transport, "token": token, "ports": list(ports),
+                "mux_con": 8, "heartbeat": 40,
+            })
+        )
+        self.existing.setdefault(kharej.id, []).append(
+            Found(name=name, role="client", active="active", data={
+                "remote_addr": f"{iran.ip}:{port}", "transport": transport, "token": token, "connection_pool": 8,
+            })
+        )
 
 
 class SimDNS:
@@ -120,66 +147,81 @@ class SimDNS:
         return f"zone {self.p.zone} (demo)"
 
 
-def seed(store: Store) -> None:
-    if store.servers:
-        return
+async def sim_resolver(fqdn, resolvers, proxy=None):
+    """Public resolvers that catch up with the record a while after it changed."""
+    ip = SimDNS.records.get(fqdn)
+    return {r: ([ip] if ip and random.random() < 0.5 else ["0.0.0.0"]) for r in resolvers[:1]}
+
+
+def seed(store: Store, net: SimNet) -> None:
     st = store
-    st.settings.check_interval = 10
-    st.settings.fail_threshold = 2
-    st.settings.test_timeout = 5
-    for name, ip, ports, prio in (
-        ("Hetzner-DE", "65.21.10.4", ["443", "8443=2096"], 1),
-        ("OVH-FR", "51.75.33.9", ["2053", "2083"], 2),
-        ("Contabo-NL", "185.2.4.77", ["2087"], 3),
-    ):
-        s = Server(name=name, role=KHAREJ, ip=ip, ports=ports, priority=prio)
-        st.servers[s.id] = s
-    for name, ip, prio in (("Tehran-AsiaTech", "185.8.172.10", 1), ("Shiraz-ParsOnline", "91.98.30.21", 2), ("Mashhad-Afranet", "79.175.140.5", 3), ("Tabriz-Shatel", "5.160.218.40", 4)):
-        s = Server(name=name, role=IRAN, ip=ip, priority=prio)
-        st.servers[s.id] = s
-    st.ensure_links()
-    cf = DNSProvider(name="Cloudflare", kind="cloudflare", api_token="demo", zone="example.com")
-    ar = DNSProvider(name="Arvan", kind="arvan", api_token="demo", zone="example.ir")
-    st.providers[cf.id], st.providers[ar.id] = cf, ar
-    kh = st.kharejs()
-    for fqdn, prov, k in (
-        ("vpn.example.com", cf, kh[0]), ("panel.example.com", cf, kh[0]), ("cdn.example.ir", ar, kh[1]),
-        ("game.example.ir", ar, kh[2]), ("api.example.com", cf, kh[1]),
-    ):
-        d = Domain(fqdn=fqdn, provider_id=prov.id, kharej_id=k.id)
-        st.domains[d.id] = d
-    # a path that is filtered in "Iran" for the fastest transports
-    st.save()
+    if not st.servers:
+        st.settings.check_interval = 10
+        st.settings.fail_threshold = 2
+        st.settings.test_timeout = 5
+        st.settings.failback_after = 120
+        st.settings.flap_window = 180
+        st.settings.scan_interval = 60
+        for name, ip, prio in (("Hetzner-DE", "65.21.10.4", 1), ("OVH-FR", "51.75.33.9", 2), ("Contabo-NL", "185.2.4.77", 3)):
+            s = Server(name=name, role=KHAREJ, ip=ip, priority=prio)
+            st.servers[s.id] = s
+        for name, ip, prio in (("Tehran-AsiaTech", "185.8.172.10", 1), ("Shiraz-ParsOnline", "91.98.30.21", 2), ("Mashhad-Afranet", "79.175.140.5", 3)):
+            s = Server(name=name, role=IRAN, ip=ip, priority=prio)
+            st.servers[s.id] = s
+        cf = DNSProvider(name="Cloudflare", kind="cloudflare", api_token="demo", zone="example.com")
+        ar = DNSProvider(name="Arvan", kind="arvan", api_token="demo", zone="example.ir")
+        st.providers[cf.id], st.providers[ar.id] = cf, ar
+        kh, ir = st.kharejs(), st.irans()
+        for fqdn, prov, k in (
+            ("vpn.example.ir", ar, kh[0]), ("panel.example.com", cf, kh[0]), ("cdn.example.ir", ar, kh[1]),
+            ("game.example.com", cf, kh[2]),
+        ):
+            d = Domain(fqdn=fqdn, provider_id=prov.id, kharej_id=k.id)
+            st.domains[d.id] = d
+        st.save()
+    kh, ir = st.kharejs(), st.irans()
+    if len(kh) >= 3 and len(ir) >= 3:
+        # tunnels "set up by hand" before the panel: the first scan adopts them
+        net.plant(ir[0], kh[0], "hetzner-teh", "tcpmux", 3080, ["443", "8443=2096"])
+        net.plant(ir[1], kh[0], "hetzner-shz", "wsmux", 3080, ["443", "8443=2096"])
+        net.plant(ir[0], kh[1], "ovh-teh", "tcp", 3081, ["2053", "2083"])
+        net.plant(ir[2], kh[1], "ovh-mhd", "quic", 3080, ["2053", "2083"])
+        net.plant(ir[1], kh[2], "contabo-shz", "kcp", 3081, ["2087"])
 
 
 async def chaos(orch, net: SimNet) -> None:
     """Break something every so often so the failover can be watched."""
     st = orch.store
-    # DPI in the demo "Iran": some transports never work on some pairs
     rnd = random.Random(7)
-    for x in st.links.values():
-        for t in ("tcp", "ws", "tcpmux", "kcp"):
-            if rnd.random() < 0.3:
-                net.blocked.add((x.iran_id, x.kharej_id, t))
-    await asyncio.sleep(3)
-    if not any(x.transport for x in st.links.values()):
-        await orch.discover_all()
+    await asyncio.sleep(4)
+    # DPI in the demo "Iran": some transports never work on some pairs
+    for i in st.irans():
+        for k in st.kharejs():
+            for t in ("tcp", "ws", "kcp"):
+                if rnd.random() < 0.3:
+                    net.blocked.add((i.id, k.id, t))
+    loop = asyncio.get_running_loop()
     while True:
-        await asyncio.sleep(random.uniform(40, 70))
+        await asyncio.sleep(random.uniform(45, 80))
         roll = random.random()
-        if roll < 0.45:
-            active = [st.link_for(d.iran_id, st.effective_kharej(d.kharej_id)) for d in st.domains.values()]
-            active = [x for x in active if x and x.transport]
-            if active:
-                x = random.choice(active)
-                net.blocked.add((x.iran_id, x.kharej_id, x.transport))
-                log.info("chaos: blocking %s on %s", x.transport, x.id)
-                asyncio.get_running_loop().call_later(240, net.blocked.discard, (x.iran_id, x.kharej_id, x.transport))
+        active = [st.links.get(st.carrier(d.link_id)) for d in st.domains.values() if d.link_id]
+        active = [x for x in active if x and x.transport]
+        if roll < 0.3 and active:
+            x = random.choice(active)
+            net.flaky[(x.iran_id, x.kharej_id)] = 0.5
+            log.info("chaos: path %s starts flapping", x.id)
+            loop.call_later(200, net.flaky.pop, (x.iran_id, x.kharej_id), None)
+        elif roll < 0.55 and active:
+            x = random.choice(active)
+            key = (x.iran_id, x.kharej_id, x.transport)
+            net.blocked.add(key)
+            log.info("chaos: blocking %s on %s", x.transport, x.id)
+            loop.call_later(240, net.blocked.discard, key)
         else:
-            role = IRAN if roll < 0.75 else KHAREJ
+            role = IRAN if roll < 0.85 else KHAREJ
             victims = [s for s in st.by_role(role) if s.id not in net.dead]
             if len(victims) > 1:
                 v = random.choice(victims)
                 net.dead.add(v.id)
                 log.info("chaos: %s goes dark", v.name)
-                asyncio.get_running_loop().call_later(random.uniform(60, 120), net.dead.discard, v.id)
+                loop.call_later(random.uniform(60, 120), net.dead.discard, v.id)

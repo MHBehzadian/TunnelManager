@@ -27,6 +27,7 @@ from .models import (
     ONLINE,
     DNSProvider,
     Domain,
+    Link,
     Server,
     Settings,
     Telegram,
@@ -38,6 +39,16 @@ from .telegram import TelegramBot
 
 log = logging.getLogger("tunnelmanager")
 STATIC = Path(__file__).parent / "static"
+MASK = "••••"
+
+
+def _ports(v: list[str]) -> list[str]:
+    out = []
+    for item in v:
+        for p in str(item).replace("\n", ",").split(","):
+            if p.strip():
+                out.append(validate_port_mapping(p))
+    return out
 
 
 # ---------------------------------------------------------------- inputs
@@ -51,8 +62,6 @@ class ServerIn(BaseModel):
     ssh_key: str | None = None
     priority: int = 100
     enabled: bool = True
-    ports: list[str] = []
-    accept_udp: bool = False
     probe_target: str = ""
 
     @field_validator("role")
@@ -69,15 +78,40 @@ class ServerIn(BaseModel):
         ipaddress.ip_address(v)  # A records need an IP, not a hostname
         return v
 
+
+class LinkIn(BaseModel):
+    ports: list[str] | None = None
+    accept_udp: bool | None = None
+    label: str | None = Field(None, max_length=40)
+    priority: int | None = None
+    allowed: list[str] | None = None
+    pinned: bool | None = None
+    apply_to_kharej: bool = False  # copy the ports to every tunnel of the same kharej
+
     @field_validator("ports")
     @classmethod
-    def _ports(cls, v):
-        out = []
-        for item in v:
-            for p in str(item).replace("\n", ",").split(","):
-                if p.strip():
-                    out.append(validate_port_mapping(p))
-        return out
+    def _p(cls, v):
+        return None if v is None else _ports(v)
+
+    @field_validator("allowed")
+    @classmethod
+    def _a(cls, v):
+        if v and any(t not in ALL_TRANSPORTS for t in v):
+            raise ValueError("unknown transport")
+        return v
+
+
+class NewLinkIn(BaseModel):
+    iran_id: str
+    kharej_id: str
+    ports: list[str] = []
+    label: str = Field("", max_length=40)
+    transport: str | None = None
+
+    @field_validator("ports")
+    @classmethod
+    def _p(cls, v):
+        return _ports(v)
 
 
 class ProviderIn(BaseModel):
@@ -98,9 +132,9 @@ class ProviderIn(BaseModel):
 class DomainIn(BaseModel):
     fqdn: str = Field(min_length=3)
     provider_id: str
-    kharej_id: str
-    iran_id: str = ""
-    ttl: int = 60
+    kharej_id: str = ""
+    group: list[str] = []
+    ttl: int = Field(120, ge=60, le=86400)
     auto_failover: bool = True
 
 
@@ -110,15 +144,15 @@ class TransportIn(BaseModel):
 
 
 class SwitchIn(BaseModel):
-    iran_id: str
-
-
-class TakeoverIn(BaseModel):
-    target_id: str | None = None
+    link_id: str
 
 
 class DiscoverIn(BaseModel):
     link_ids: list[str] | None = None
+
+
+class LayoutIn(BaseModel):
+    positions: dict[str, list[float]]
 
 
 class LoginIn(BaseModel):
@@ -129,9 +163,6 @@ class LoginIn(BaseModel):
 class SetupIn(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=6)
-
-
-MASK = "••••"
 
 
 def keep_secret(new: str | None, old: str) -> str:
@@ -164,19 +195,21 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
     hub = Hub()
     pool = SSHPool()
     bot = TelegramBot(lambda: store.settings.tg())
+    resolver = None
     if demo:
-        from .demo import SimDNS, SimNet, seed
+        from .demo import SimDNS, SimNet, seed, sim_resolver
 
-        seed(store)
         driver = SimNet(jitter=True)
+        seed(store, driver)
         dns_factory = SimDNS
+        resolver = sim_resolver
     else:
         driver = driver or SSHDriver(pool, data / "cache", store.settings.backpack_release)
 
         def dns_factory(p: DNSProvider):
             return client_for(p, proxy=os.environ.get("TM_DNS_PROXY") or None)
 
-    orch = Orchestrator(store, driver, dns_factory, notify=bot.notify, broadcast=hub.send)
+    orch = Orchestrator(store, driver, dns_factory, notify=bot.notify, broadcast=hub.send, resolver=resolver)
     bot.handler = orch.bot_command
     monitor_enabled = os.environ.get("TM_NO_MONITOR") != "1"
 
@@ -188,7 +221,7 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
             from .demo import chaos
 
             tasks.append(asyncio.create_task(chaos(orch, driver)))
-        await orch.emit("info", "panel", f"پنل TunnelManager {__version__} راه‌اندازی شد" + (" (حالت دمو)" if demo else ""), notify=True)
+        await orch.emit("info", "panel", f"پنل TunnelManager {__version__} راه‌اندازی شد" + (" (حالت دمو)" if demo else ""))
         yield
         for task in tasks:
             task.cancel()
@@ -210,6 +243,10 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         if obj is None:
             raise HTTPException(404, "not found")
         return obj
+
+    def busy_guard(lid: str) -> None:
+        if lid in orch.busy:
+            raise HTTPException(409, "عملیات دیگری روی این تانل در جریان است")
 
     # ---- auth --------------------------------------------------------
     @app.get("/api/session")
@@ -256,9 +293,12 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
             **st,
             "settings": settings,
             "busy": sorted(orch.busy),
+            "flapping": [x.id for x in store.links.values() if orch.flapping(x)],
             "last_check": orch.last_check,
+            "last_scan": orch.last_scan,
             "transports": ALL_TRANSPORTS,
             "version": __version__,
+            "demo": demo,
             "now": time.time(),
         }
 
@@ -266,7 +306,6 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
     async def state():
         return {**full_state(), "events": [e.to_dict() for e in store.events[-200:]]}
 
-    # push the full state (with meta) instead of the bare snapshot
     async def broadcast(msg: dict) -> None:
         if msg.get("type") == "state":
             msg = {"type": "state", "state": full_state()}
@@ -290,32 +329,46 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         finally:
             hub.clients.discard(websocket)
 
-    # ---- servers -----------------------------------------------------
-    @app.post("/api/servers", dependencies=A)
-    async def add_server(body: ServerIn):
-        if any(s.ip == body.ip and s.role == body.role for s in store.servers.values()):
-            raise HTTPException(409, "این آی‌پی قبلا اضافه شده")
-        srv = Server(**{**body.model_dump(), "ssh_password": body.ssh_password or "", "ssh_key": body.ssh_key or ""})
-        if srv.role == IRAN:
-            srv.ports = []
-        store.servers[srv.id] = srv
-        created = store.ensure_links()
-        await orch.emit("info", "server", f"سرور {'داخل' if srv.role == IRAN else 'خارج'} {srv.name} ({srv.ip}) اضافه شد", notify=False, server=srv.id)
-        orch.spawn(probe_server(srv))
-        return {"server": srv.public(), "links_created": len(created)}
+    @app.put("/api/layout", dependencies=A)
+    async def put_layout(body: LayoutIn):
+        for k, v in body.positions.items():
+            if len(v) == 2 and (k in store.servers or k in store.domains):
+                store.layout[k] = [round(float(v[0]), 1), round(float(v[1]), 1)]
+        store.save()
+        return {"ok": True}
 
-    async def probe_server(srv: Server) -> None:
+    @app.delete("/api/layout", dependencies=A)
+    async def reset_layout():
+        store.layout.clear()
+        await orch.changed()
+        return {"ok": True}
+
+    # ---- servers -----------------------------------------------------
+    async def probe_server(srv: Server, scan: bool = True) -> None:
         try:
             srv.ssh_latency_ms = round(await driver.ping(srv), 1)
             srv.status, srv.fail_count, srv.last_seen, srv.error = ONLINE, 0, time.time(), ""
         except (SSHError, OSError) as e:
             srv.status, srv.error = "offline", str(e)
         await orch.changed()
+        if scan and srv.status == ONLINE and store.settings.auto_adopt:
+            await orch.scan_all()
+            orch.wake()
+
+    @app.post("/api/servers", dependencies=A)
+    async def add_server(body: ServerIn):
+        if any(s.ip == body.ip and s.role == body.role for s in store.servers.values()):
+            raise HTTPException(409, "این آی‌پی قبلا اضافه شده")
+        srv = Server(**{**body.model_dump(), "ssh_password": body.ssh_password or "", "ssh_key": body.ssh_key or ""})
+        store.servers[srv.id] = srv
+        store.ensure_links()
+        await orch.emit("info", "server", f"سرور {'داخل' if srv.role == IRAN else 'خارج'} {srv.name} ({srv.ip}) اضافه شد", server=srv.id)
+        orch.spawn(probe_server(srv))  # also looks for tunnels already running
+        return {"server": srv.public()}
 
     @app.put("/api/servers/{sid}", dependencies=A)
     async def edit_server(sid: str, body: ServerIn):
         srv = get(store.servers, sid)
-        old_ports = list(srv.ports)
         old_conn = (srv.ip, srv.ssh_port, srv.ssh_user)
         upd = body.model_dump()
         upd["ssh_password"] = keep_secret(body.ssh_password, srv.ssh_password)
@@ -327,18 +380,20 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
             pool.drop(srv.id)
             srv.backpack_version = ""
         await orch.changed()
-        if srv.role == KHAREJ and srv.ports != old_ports:
-            orch.spawn(orch.ports_changed(srv.id))
-        orch.spawn(probe_server(srv))
+        orch.spawn(probe_server(srv, scan=False))
         return {"server": srv.public()}
 
     @app.delete("/api/servers/{sid}", dependencies=A)
     async def del_server(sid: str):
         srv = get(store.servers, sid)
-        if any(d.kharej_id == sid for d in store.domains.values()):
-            raise HTTPException(409, "اول دامنه‌های متصل به این سرور را حذف یا جابه‌جا کنید")
+        def uses(d: Domain) -> bool:
+            in_group = any(sid in (x.iran_id, x.kharej_id) for x in (store.links.get(i) for i in d.group) if x)
+            return d.kharej_id == sid or in_group
+
+        if any(uses(d) for d in store.domains.values()):
+            raise HTTPException(409, "اول دامنه‌های متصل به این سرور را حذف یا ویرایش کنید")
         links = store.remove_server(sid)
-        await orch.emit("warning", "server", f"سرور {srv.name} حذف شد", notify=False)
+        await orch.emit("warning", "server", f"سرور {srv.name} از پنل حذف شد", notify=False)
         orch.spawn(orch.remove_links(links))
         pool.drop(sid)
         return {"ok": True}
@@ -357,28 +412,68 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
     @app.post("/api/servers/{sid}/test", dependencies=A)
     async def test_server(sid: str):
         srv = get(store.servers, sid)
-        await probe_server(srv)
+        await probe_server(srv, scan=False)
         return {"status": srv.status, "latency_ms": srv.ssh_latency_ms, "error": srv.error}
 
-    # ---- kharej failover ----------------------------------------------
-    @app.post("/api/kharej/{sid}/takeover", dependencies=A)
-    async def takeover(sid: str, body: TakeoverIn):
-        srv = get(store.servers, sid)
-        if srv.role != KHAREJ:
-            raise HTTPException(400, "only kharej servers")
-        target = store.servers.get(body.target_id) if body.target_id else None
-        ok = await orch.takeover(srv, target)
-        return {"ok": ok}
-
-    @app.post("/api/kharej/{sid}/release", dependencies=A)
-    async def release(sid: str):
-        srv = get(store.servers, sid)
-        if sid not in store.takeover:
-            raise HTTPException(400, "not taken over")
-        await orch.release(srv)
-        return {"ok": True}
+    @app.post("/api/scan", dependencies=A)
+    async def scan():
+        n = await orch.scan_all()
+        if not n:
+            await orch.emit("info", "adopt", "جستجوی تانل‌های موجود روی سرورها انجام شد؛ تانل جدیدی پیدا نشد", notify=False)
+        orch.wake()
+        return {"added": n}
 
     # ---- links -------------------------------------------------------
+    @app.post("/api/links", dependencies=A)
+    async def add_link(body: NewLinkIn):
+        iran, kharej = get(store.servers, body.iran_id), get(store.servers, body.kharej_id)
+        if iran.role != IRAN or kharej.role != KHAREJ:
+            raise HTTPException(400, "iran_id must be an Iran server and kharej_id a kharej server")
+        if body.transport and body.transport not in ALL_TRANSPORTS:
+            raise HTTPException(400, "unknown transport")
+        link = Link(iran_id=iran.id, kharej_id=kharej.id, tunnel_port=store.free_port(iran.id, store.settings.tunnel_port_base))
+        link.probe_port = store.free_port(iran.id, store.settings.probe_port_base)
+        link.ports, link.label = body.ports, body.label
+        store.links[link.id] = link
+        await orch.changed()
+        if body.transport:
+            orch.spawn(orch.set_transport(link, body.transport, pin=False))
+        else:
+            orch.spawn(orch.discover(link))
+        return {"link": link.id}
+
+    @app.put("/api/links/{lid}", dependencies=A)
+    async def edit_link(lid: str, body: LinkIn):
+        link = get(store.links, lid)
+        busy_guard(lid)
+        before = (list(link.ports), link.accept_udp)
+        for k in ("ports", "accept_udp", "label", "priority", "allowed", "pinned"):
+            v = getattr(body, k)
+            if v is not None:
+                setattr(link, k, v)
+        targets = [link] if (list(link.ports), link.accept_udp) != before else []
+        if body.apply_to_kharej and body.ports is not None:
+            for other in store.links.values():
+                if other.kharej_id == link.kharej_id and other.id != link.id and other.ports != link.ports:
+                    other.ports = list(link.ports)
+                    targets.append(other)
+        await orch.changed()
+        for t in targets:
+            orch.spawn(orch.ports_changed(t))
+        return {"ok": True}
+
+    @app.delete("/api/links/{lid}", dependencies=A)
+    async def del_link(lid: str, purge: bool = False):
+        link = get(store.links, lid)
+        busy_guard(lid)
+        store.remove_link(lid)
+        remove_files = purge or link.managed
+        if remove_files:
+            link.managed = True  # the user asked for the files to go too
+            orch.spawn(orch.remove_links([link]))
+        await orch.emit("warning", "link", f"تانل {orch.link_label(link)} از پنل حذف شد" + (" و از روی سرورها پاک شد" if remove_files else ""), notify=False)
+        return {"ok": True}
+
     @app.post("/api/discover", dependencies=A)
     async def discover(body: DiscoverIn):
         orch.spawn(orch.discover_all(body.link_ids))
@@ -389,25 +484,27 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         link = get(store.links, lid)
         if body.transport not in ALL_TRANSPORTS:
             raise HTTPException(400, "unknown transport")
-        if lid in orch.busy:
-            raise HTTPException(409, "عملیات دیگری روی این تانل در جریان است")
+        busy_guard(lid)
         orch.spawn(orch.set_transport(link, body.transport, body.pin))
         return {"started": True}
 
     @app.post("/api/links/{lid}/retest", dependencies=A)
     async def retest(lid: str):
         link = get(store.links, lid)
-        if lid in orch.busy:
-            raise HTTPException(409, "عملیات دیگری روی این تانل در جریان است")
+        busy_guard(lid)
         orch.spawn(orch.discover(link))
         return {"started": True}
 
-    @app.post("/api/links/{lid}/pin", dependencies=A)
-    async def pin(lid: str, body: dict):
+    @app.post("/api/links/{lid}/release", dependencies=A)
+    async def release(lid: str):
         link = get(store.links, lid)
-        link.pinned = bool(body.get("pinned"))
-        await orch.changed()
-        return {"pinned": link.pinned}
+        if lid not in store.handover:
+            raise HTTPException(400, "ports are not handed over")
+        dst = store.links[store.handover.pop(lid)]
+        await orch.redeploy_iran_side(dst)
+        await orch.redeploy_iran_side(link)
+        await orch.emit("info", "handover", f"پورت‌های {orch.link_label(link)} به صورت دستی به خودش برگشت")
+        return {"ok": True}
 
     @app.post("/api/check", dependencies=A)
     async def check_now():
@@ -449,8 +546,8 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
 
     # ---- domains -----------------------------------------------------
     async def adopt_record(d: Domain) -> None:
-        """Read the live A record; if it already points at one of our Iran
-        servers, take that as the starting point instead of changing DNS."""
+        """Read the live A record, so a domain that already points at one of
+        our Iran servers starts from there instead of changing DNS."""
         p = store.providers.get(d.provider_id)
         if not p:
             return
@@ -461,20 +558,17 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
             await orch.changed()
             return
         d.current_ip = ips[0] if ips else ""
-        if not d.iran_id:
-            match = next((s for s in store.irans() if s.ip in ips), None)
-            if match:
-                d.iran_id = match.id
         await orch.changed()
         orch.wake()
 
     def check_domain(body: DomainIn) -> None:
         p = get(store.providers, body.provider_id)
-        k = get(store.servers, body.kharej_id)
-        if k.role != KHAREJ:
+        if body.kharej_id and get(store.servers, body.kharej_id).role != KHAREJ:
             raise HTTPException(400, "kharej_id must be a kharej server")
-        if body.iran_id and get(store.servers, body.iran_id).role != IRAN:
-            raise HTTPException(400, "iran_id must be an Iran server")
+        if not body.kharej_id and not body.group:
+            raise HTTPException(400, "یک سرور خارج یا گروهی از تانل‌ها انتخاب کنید")
+        for lid in body.group:
+            get(store.links, lid)
         try:
             client_for(p).relative(body.fqdn)
         except Exception as e:
@@ -496,6 +590,7 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         check_domain(body)
         d.fqdn = body.fqdn.strip().rstrip(".").lower()
         d.provider_id, d.kharej_id, d.ttl, d.auto_failover = body.provider_id, body.kharej_id, body.ttl, body.auto_failover
+        d.group = list(body.group)
         await orch.changed()
         orch.wake()
         return {"domain": d.to_dict()}
@@ -510,12 +605,10 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
     @app.post("/api/domains/{did}/switch", dependencies=A)
     async def switch(did: str, body: SwitchIn):
         d = get(store.domains, did)
-        iran = get(store.servers, body.iran_id)
-        if iran.role != IRAN:
-            raise HTTPException(400, "not an Iran server")
-        ok = await orch.switch_domain(d, iran, "")
+        link = get(store.links, body.link_id)
+        ok = await orch.move_domain(d, link, "انتقال دستی از پنل")
         if not ok:
-            raise HTTPException(502, d.error or "DNS update failed")
+            raise HTTPException(502, d.error or "switch failed")
         await orch.changed()
         orch.wake()
         return {"ok": True}
@@ -543,6 +636,10 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         new.check_interval = max(10, int(new.check_interval))
         new.fail_threshold = max(1, int(new.fail_threshold))
         new.test_timeout = max(5, int(new.test_timeout))
+        new.failback_after = max(60, int(new.failback_after))
+        new.flap_window = max(60, int(new.flap_window))
+        new.flap_count = max(2, int(new.flap_count))
+        new.scan_interval = max(60, int(new.scan_interval))
         if tg_in is not None:
             old = store.settings.tg()
             tg = Telegram.from_dict({**old.to_dict(), **tg_in})
@@ -571,4 +668,3 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
 
     return app
-

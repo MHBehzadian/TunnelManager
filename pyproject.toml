@@ -1,6 +1,6 @@
 [project]
 name = "tunnelmanager"
-version = "0.1.0"
+version = "0.2.0"
 description = "Control panel for BackPack reverse tunnels with automatic failover and Cloudflare/ArvanCloud DNS switching"
 requires-python = ">=3.10"
 dependencies = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "asyncssh>=2.14", "httpx[socks]>=0.27"]

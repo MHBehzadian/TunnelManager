@@ -22,37 +22,48 @@ def test_setup_login_and_crud(tmp_path):
         assert c.post("/api/setup", json={"username": "x", "password": "secret2"}).status_code == 409
         assert c.get("/api/state").status_code == 200
 
-        k = c.post("/api/servers", json={"name": "K", "role": "kharej", "ip": "10.0.0.1", "ssh_password": "pw", "ports": ["443\n8443=2096"]}).json()
-        assert k["server"]["ports"] == ["443", "8443=2096"]
+        k = c.post("/api/servers", json={"name": "K", "role": "kharej", "ip": "10.0.0.1", "ssh_password": "pw"}).json()
         assert k["server"]["ssh_password"] == "••••"
-        r = c.post("/api/servers", json={"name": "I", "role": "iran", "ip": "10.0.0.2"})
-        assert r.json()["links_created"] == 1
-        bad = c.post("/api/servers", json={"name": "X", "role": "iran", "ip": "not-an-ip"})
-        assert bad.status_code == 422
-        inj = c.post("/api/servers", json={"name": "X", "role": "kharej", "ip": "10.0.0.9", "ports": ["443;reboot"]})
-        assert inj.status_code == 422
+        assert c.post("/api/servers", json={"name": "I", "role": "iran", "ip": "10.0.0.2"}).status_code == 200
+        assert c.post("/api/servers", json={"name": "X", "role": "iran", "ip": "not-an-ip"}).status_code == 422
+        sid = k["server"]["id"]
 
         # editing with the mask keeps the stored secret
-        sid = k["server"]["id"]
-        c.put(f"/api/servers/{sid}", json={"name": "K2", "role": "kharej", "ip": "10.0.0.1", "ssh_password": "••••", "ports": ["443"]})
-        assert c.app.state.store.servers[sid].ssh_password == "pw"
-        assert c.app.state.store.servers[sid].name == "K2"
+        c.put(f"/api/servers/{sid}", json={"name": "K2", "role": "kharej", "ip": "10.0.0.1", "ssh_password": "••••"})
+        store = c.app.state.store
+        assert store.servers[sid].ssh_password == "pw" and store.servers[sid].name == "K2"
 
-        p = c.post("/api/providers", json={"name": "cf", "kind": "cloudflare", "api_token": "tok", "zone": "Example.com."}).json()["provider"]
-        assert p["zone"] == "example.com" and p["api_token"] == "••••"
-        d = c.post("/api/domains", json={"fqdn": "a.example.com", "provider_id": p["id"], "kharej_id": sid})
+        # a pair gets an (unbuilt) tunnel; ports are set on it, Iran side
+        st = c.get("/api/state").json()
+        assert len(st["links"]) == 1
+        lid = st["links"][0]["id"]
+        assert c.put(f"/api/links/{lid}", json={"ports": ["443\n8443=2096"], "label": "main"}).status_code == 200
+        assert store.links[lid].ports == ["443", "8443=2096"]
+        assert c.put(f"/api/links/{lid}", json={"ports": ["443;reboot"]}).status_code == 422
+        assert c.put(f"/api/links/{lid}", json={"allowed": ["bogus"]}).status_code == 422
+
+        p = c.post("/api/providers", json={"name": "ar", "kind": "arvan", "api_token": "tok", "zone": "Example.ir."}).json()["provider"]
+        assert p["zone"] == "example.ir" and p["api_token"] == "••••"
+        d = c.post("/api/domains", json={"fqdn": "a.example.ir", "provider_id": p["id"], "kharej_id": sid})
         assert d.status_code == 200
-        out = c.post("/api/domains", json={"fqdn": "a.other.com", "provider_id": p["id"], "kharej_id": sid})
-        assert out.status_code == 400
+        did = d.json()["domain"]["id"]
+        assert c.post("/api/domains", json={"fqdn": "a.other.com", "provider_id": p["id"], "kharej_id": sid}).status_code == 400
+        assert c.post("/api/domains", json={"fqdn": "b.example.ir", "provider_id": p["id"]}).status_code == 400
+        assert c.put(f"/api/domains/{did}", json={"fqdn": "a.example.ir", "provider_id": p["id"], "group": [lid]}).status_code == 200
+        assert store.domains[did].group == [lid]
 
         st = c.get("/api/state").json()
-        assert len(st["servers"]) == 2 and len(st["links"]) == 1 and len(st["domains"]) == 1
-        assert all(x["token"] == "" for x in st["links"])  # secrets never leave the panel
-        assert c.delete(f"/api/servers/{sid}").status_code == 409  # domain still uses it
+        assert all(x["token"] == "" and "iran_base" not in x for x in st["links"])  # secrets never leave
+        assert st["domains"][0]["effective_group"] == [lid]
+        assert c.delete(f"/api/servers/{sid}").status_code == 409  # a domain still uses it
 
-        s = c.put("/api/settings", json={"check_interval": 3, "candidate_transports": ["tcpmux", "quic"], "telegram": {"bot_token": "123:abc", "chat_ids": ["1", " "]}}).json()
+        # canvas layout persists
+        assert c.put("/api/layout", json={"positions": {sid: [10, 20], "nope": [1, 1]}}).status_code == 200
+        assert c.get("/api/state").json()["layout"] == {sid: [10.0, 20.0]}
+
+        s = c.put("/api/settings", json={"check_interval": 3, "failback_after": 600, "candidate_transports": ["tcpmux", "quic"], "telegram": {"bot_token": "123:abc", "chat_ids": ["1", " "]}}).json()
         assert s["check_interval"] == 10 and s["telegram"]["bot_token"] == "••••" and s["telegram"]["chat_ids"] == ["1"]
-        assert c.app.state.store.settings.tg().bot_token == "123:abc"
+        assert store.settings.tg().bot_token == "123:abc" and store.settings.failback_after == 600
         assert c.put("/api/settings", json={"candidate_transports": ["bogus"]}).status_code == 400
 
         assert c.get("/").status_code == 200
@@ -64,4 +75,5 @@ def test_setup_login_and_crud(tmp_path):
     # state survives a restart
     with client(tmp_path) as c:
         c.post("/api/login", json={"username": "admin", "password": "secret1"})
-        assert len(c.get("/api/state").json()["servers"]) == 2
+        st = c.get("/api/state").json()
+        assert len(st["servers"]) == 2 and st["links"][0]["ports"] == ["443", "8443=2096"]

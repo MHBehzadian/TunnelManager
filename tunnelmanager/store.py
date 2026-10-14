@@ -11,7 +11,7 @@ from typing import Any
 from .models import (
     IRAN,
     KHAREJ,
-    L_SUSPENDED,
+    L_PENDING,
     DNSProvider,
     Domain,
     Event,
@@ -23,6 +23,11 @@ from .models import (
 MAX_EVENTS = 1000
 
 
+def listen_key(mapping: str) -> str:
+    """The listening half of a port mapping: "443", "1.2.3.4:443", "2053-2060"."""
+    return mapping.split("=", 1)[0].strip()
+
+
 class Store:
     def __init__(self, path: Path | str | None):
         self.path = Path(path) if path else None
@@ -32,8 +37,10 @@ class Store:
         self.providers: dict[str, DNSProvider] = {}
         self.settings = Settings()
         self.events: list[Event] = []
-        # kharej failover: dead kharej id -> kharej id now carrying its ports
-        self.takeover: dict[str, str] = {}
+        # port handover: link id -> link id (same Iran server) now exposing its ports
+        self.handover: dict[str, str] = {}
+        # dashboard canvas: node id -> [x, y]
+        self.layout: dict[str, list[float]] = {}
         if self.path and self.path.exists():
             self.load()
 
@@ -47,7 +54,29 @@ class Store:
         self.providers = {d["id"]: DNSProvider.from_dict(d) for d in raw.get("providers", [])}
         self.settings = Settings.from_dict(raw.get("settings", {}))
         self.events = [Event.from_dict(d) for d in raw.get("events", [])]
-        self.takeover = dict(raw.get("takeover", {}))
+        self.handover = dict(raw.get("handover", {}))
+        self.layout = dict(raw.get("layout", {}))
+        self._migrate(raw)
+
+    def _migrate(self, raw: dict) -> None:
+        # v0.1 kept forwarded ports on the kharej server; they belong to the
+        # Iran side of each tunnel
+        for s in raw.get("servers", []):
+            if s.get("role") == KHAREJ and s.get("ports"):
+                for link in self.links.values():
+                    if link.kharej_id == s["id"] and not link.ports:
+                        link.ports = list(s["ports"])
+                        link.accept_udp = bool(s.get("accept_udp"))
+        for link in self.links.values():
+            if link.status == "suspended":
+                link.status = L_PENDING if not link.transport else "down"
+        # v0.1 domains pointed at an Iran server rather than a tunnel
+        for raw_d in raw.get("domains", []):
+            d = self.domains.get(raw_d.get("id", ""))
+            if d and not d.link_id and d.kharej_id and raw_d.get("iran_id"):
+                link = self.link_for(raw_d["iran_id"], d.kharej_id)
+                if link:
+                    d.link_id = link.id
 
     def save(self) -> None:
         if not self.path:
@@ -59,7 +88,8 @@ class Store:
             "providers": [p.to_dict() for p in self.providers.values()],
             "settings": self.settings.to_dict(),
             "events": [e.to_dict() for e in self.events[-MAX_EVENTS:]],
-            "takeover": self.takeover,
+            "handover": self.handover,
+            "layout": self.layout,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".state-")
@@ -81,90 +111,147 @@ class Store:
     def kharejs(self) -> list[Server]:
         return self.by_role(KHAREJ)
 
+    def links_between(self, iran_id: str, kharej_id: str) -> list[Link]:
+        return sorted(
+            (x for x in self.links.values() if x.iran_id == iran_id and x.kharej_id == kharej_id),
+            key=lambda x: (x.priority, x.status == L_PENDING, x.id),
+        )
+
     def link_for(self, iran_id: str, kharej_id: str) -> Link | None:
-        for link in self.links.values():
-            if link.iran_id == iran_id and link.kharej_id == kharej_id:
-                return link
-        return None
+        found = self.links_between(iran_id, kharej_id)
+        return found[0] if found else None
 
     def links_of(self, server_id: str) -> list[Link]:
         return [x for x in self.links.values() if server_id in (x.iran_id, x.kharej_id)]
 
-    def effective_kharej(self, kharej_id: str) -> str:
-        """Follow the takeover chain: whose tunnels carry this kharej's ports now."""
+    def carrier(self, link_id: str) -> str:
+        """Follow the handover chain: which link exposes this link's ports now."""
         seen = set()
-        while kharej_id in self.takeover and kharej_id not in seen:
-            seen.add(kharej_id)
-            kharej_id = self.takeover[kharej_id]
-        return kharej_id
+        while link_id in self.handover and link_id not in seen:
+            seen.add(link_id)
+            link_id = self.handover[link_id]
+        return link_id
 
     def link_ports(self, link: Link) -> list[str]:
-        """Forwarded ports the Iran end of a link exposes: its own kharej's
-        ports plus those of every kharej it took over. A suspended link
-        exposes nothing (its ports moved elsewhere)."""
-        if link.status == L_SUSPENDED or link.kharej_id in self.takeover:
+        """Forwarded ports the Iran end of a link exposes: its own (unless it
+        handed them over) plus those of every link handed over to it."""
+        if link.id in self.handover:
             return []
         out: list[str] = []
         listening: set[str] = set()
-        owners = [link.kharej_id] + [
-            k for k in self.takeover if self.effective_kharej(k) == link.kharej_id
+        owners = [link] + [
+            self.links[s] for s in self.handover if s in self.links and self.carrier(s) == link.id
         ]
-        for kid in owners:
-            k = self.servers.get(kid)
-            if not k:
-                continue
-            for p in k.ports:
-                key = p.split("=", 1)[0].strip()
-                if key not in listening:  # the owner's own mapping wins a clash
+        for owner in owners:
+            for p in owner.ports:
+                key = listen_key(p)
+                if key not in listening:  # the carrier's own mapping wins a clash
                     listening.add(key)
                     out.append(p)
         return out
 
-    def next_port(self, iran_id: str, attr: str, base: int) -> int:
-        used = {getattr(x, attr) for x in self.links.values() if x.iran_id == iran_id}
+    def used_ports(self, iran_id: str) -> set[int]:
+        used: set[int] = set()
+        for x in self.links.values():
+            if x.iran_id == iran_id:
+                used.add(x.tunnel_port)
+                if x.probe_port:
+                    used.add(x.probe_port)
+        return used
+
+    def free_port(self, iran_id: str, base: int) -> int:
+        used = self.used_ports(iran_id)
         p = base
         while p in used:
             p += 1
         return p
 
     def ensure_links(self) -> list[Link]:
-        """Make sure every Iran x kharej pair has a link object."""
-        created = []
+        """Offer a (not yet built) tunnel for every Iran x kharej pair that has none."""
+        created: list[Link] = []
+        if not self.settings.auto_mesh:
+            return created
         for i in self.irans():
             for k in self.kharejs():
                 if self.link_for(i.id, k.id) is None:
                     link = Link(
                         iran_id=i.id,
                         kharej_id=k.id,
-                        tunnel_port=self.next_port(i.id, "tunnel_port", self.settings.tunnel_port_base),
-                        probe_port=self.next_port(i.id, "probe_port", self.settings.probe_port_base),
+                        tunnel_port=self.free_port(i.id, self.settings.tunnel_port_base),
                     )
+                    link.probe_port = self.free_port(i.id, self.settings.probe_port_base)
+                    # start from the ports this kharej is already served on elsewhere
+                    sibling = next((x for x in self.links.values() if x.kharej_id == k.id and x.ports), None)
+                    if sibling:
+                        link.ports = list(sibling.ports)
                     self.links[link.id] = link
                     created.append(link)
         return created
 
+    def remove_link(self, link_id: str) -> Link | None:
+        link = self.links.pop(link_id, None)
+        self.handover = {k: v for k, v in self.handover.items() if link_id not in (k, v)}
+        for d in self.domains.values():
+            d.group = [x for x in d.group if x != link_id]
+            if d.link_id == link_id:
+                d.link_id = ""
+        self.layout.pop(link_id, None)
+        return link
+
     def remove_server(self, server_id: str) -> list[Link]:
         removed = [x for x in self.links.values() if server_id in (x.iran_id, x.kharej_id)]
         for x in removed:
-            del self.links[x.id]
+            self.remove_link(x.id)
         self.servers.pop(server_id, None)
-        self.takeover = {k: v for k, v in self.takeover.items() if server_id not in (k, v)}
-        for d in self.domains.values():
-            if d.iran_id == server_id:
-                d.iran_id = ""
+        self.layout.pop(server_id, None)
         return removed
+
+    # ---- domains -----------------------------------------------------
+    def group_of(self, d: Domain) -> list[Link]:
+        """The tunnels a domain may use, most preferred first."""
+        if d.group:
+            return [self.links[x] for x in d.group if x in self.links]
+        if not d.kharej_id:
+            return [self.links[d.link_id]] if d.link_id in self.links else []
+        prio = {s.id: (s.priority, s.name) for s in self.servers.values()}
+        own = [x for x in self.links.values() if x.kharej_id == d.kharej_id]
+        own.sort(key=lambda x: (prio.get(x.iran_id, (999, "")), x.priority, x.id))
+        # when the kharej itself is gone, other kharejs can stand in
+        others = [x for x in self.links.values() if x.kharej_id != d.kharej_id]
+        others.sort(key=lambda x: (prio.get(x.kharej_id, (999, "")), prio.get(x.iran_id, (999, "")), x.priority, x.id))
+        # tunnels not built yet go last: never the primary, only a last resort to build
+        ordered = own + others
+        return [x for x in ordered if x.status != L_PENDING] + [x for x in ordered if x.status == L_PENDING]
+
+    def primary_of(self, d: Domain) -> Link | None:
+        g = self.group_of(d)
+        return g[0] if g else None
 
     def snapshot(self) -> dict[str, Any]:
         """What the dashboard renders. Secrets are masked."""
+        links = []
+        for x in self.links.values():
+            d = x.to_dict()
+            d.pop("iran_base", None)
+            d.pop("kharej_base", None)
+            d["token"] = ""
+            d["exposed"] = self.link_ports(x)
+            d["carrier"] = self.carrier(x.id)
+            links.append(d)
+        domains = []
+        for d in self.domains.values():
+            dd = d.to_dict()
+            dd["carrier_id"] = self.carrier(d.link_id) if d.link_id else ""
+            dd["effective_group"] = [x.id for x in self.group_of(d)]
+            p = self.primary_of(d)
+            dd["primary_id"] = p.id if p else ""
+            domains.append(dd)
         return {
             "servers": [s.public() for s in self.servers.values()],
-            "links": [
-                {**x.to_dict(), "token": "", "ports": self.link_ports(x)} for x in self.links.values()
-            ],
-            "domains": [
-                {**d.to_dict(), "effective_kharej_id": self.effective_kharej(d.kharej_id)}
-                for d in self.domains.values()
-            ],
+            "links": links,
+            "domains": domains,
             "providers": [p.public() for p in self.providers.values()],
-            "takeover": self.takeover,
+            "handover": self.handover,
+            "layout": self.layout,
         }
+
