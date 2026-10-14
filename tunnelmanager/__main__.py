@@ -47,6 +47,20 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     host = getattr(args, "host", os.environ.get("TM_HOST", "0.0.0.0"))
     port = getattr(args, "port", int(os.environ.get("TM_PORT", "8080")))
+    import socket
+
+    probe = socket.socket()
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((host, port))
+    except OSError:
+        raise SystemExit(
+            f"port {port} is already in use on {host} - pick another one with --port, e.g. --port {port + 1010}\n"
+            f"پورت {port} اشغال است؛ با --port یک پورت دیگر بدهید، مثلا --port {port + 1010}"
+        ) from None
+    finally:
+        probe.close()
+
     demo = args.cmd == "demo"
     data = args.data if not demo else os.path.join(args.data, "demo")
     tls = {}
