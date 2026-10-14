@@ -72,10 +72,14 @@ sudo bash deploy/install.sh
 ### اجرای دستی یا دمو
 
 ```bash
-pip install -r requirements.txt
-python -m tunnelmanager serve --port 8080      # پنل واقعی
-python -m tunnelmanager demo  --port 8080      # دمو با شبکه شبیه‌سازی‌شده
+apt install -y python3-venv
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+./venv/bin/python -m tunnelmanager demo --host 0.0.0.0 --port 8080     # دمو با شبکه شبیه‌سازی‌شده
+./venv/bin/python -m tunnelmanager serve --host 0.0.0.0 --port 8080    # پنل واقعی
 ```
+
+بعد در مرورگر `http://IP-سرور:8080` را باز کنید. در اولین ورود، نام کاربری و رمز را خودتان تعیین می‌کنید.
 
 حالت **دمو** به هیچ سروری وصل نمی‌شود. چند سرور با تانل‌های «از قبل موجود» می‌سازد و هر یک دقیقه چیزی را خراب می‌کند، تا جابه‌جایی‌ها را زنده ببینید:
 
