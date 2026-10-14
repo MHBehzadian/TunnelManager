@@ -1,0 +1,13 @@
+[project]
+name = "tunnelmanager"
+version = "0.1.0"
+description = "Control panel for BackPack reverse tunnels with automatic failover and Cloudflare/ArvanCloud DNS switching"
+requires-python = ">=3.10"
+dependencies = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "asyncssh>=2.14", "httpx[socks]>=0.27"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

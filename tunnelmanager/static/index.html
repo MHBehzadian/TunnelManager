@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TunnelManager</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f172a'/%3E%3Cpath d='M6 22c4-10 16-10 20 0' stroke='%2322d3ee' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='6' cy='22' r='3' fill='%2334d399'/%3E%3Ccircle cx='26' cy='22' r='3' fill='%2334d399'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="auth" class="auth hidden">
+  <form class="auth-card" id="auth-form">
+    <div class="brand big"><span class="logo"></span><span>TunnelManager</span></div>
+    <p class="muted" id="auth-sub">ورود به پنل مدیریت تانل‌ها</p>
+    <label>نام کاربری<input name="username" autocomplete="username" required value="admin"></label>
+    <label>رمز عبور<input name="password" type="password" autocomplete="current-password" required minlength="6"></label>
+    <button class="btn primary wide" type="submit" id="auth-btn">ورود</button>
+    <p class="error" id="auth-err"></p>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header class="topbar">
+    <div class="brand"><span class="logo"></span><span>TunnelManager</span><span class="ver" id="ver"></span></div>
+    <div class="stats" id="stats"></div>
+    <div class="actions">
+      <span class="live" id="live" title="اتصال زنده"><i></i><span id="last-check">—</span></span>
+      <button class="btn ghost" id="btn-check" title="بررسی فوری همه مسیرها">⟳ بررسی</button>
+      <button class="btn primary" id="btn-discover" title="تست همه پروتکل‌ها و اتصال با بهترین">⚡ تست و اتصال همه</button>
+      <div class="menu">
+        <button class="btn ghost" id="btn-add">＋ افزودن</button>
+        <div class="menu-pop" id="add-pop">
+          <button data-add="kharej">🌍 سرور خارج</button>
+          <button data-add="iran">🏠 سرور داخل</button>
+          <button data-add="provider">🔑 حساب DNS</button>
+          <button data-add="domain">🌐 دامنه</button>
+        </div>
+      </div>
+      <button class="btn icon" id="btn-settings" title="تنظیمات">⚙</button>
+      <button class="btn icon" id="btn-theme" title="تم روشن/تاریک">◐</button>
+      <button class="btn icon" id="btn-logout" title="خروج">⎋</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="board">
+      <div class="legend">
+        <span><i class="sw up"></i>وصل</span>
+        <span><i class="sw degraded"></i>ناپایدار</span>
+        <span><i class="sw down"></i>قطع</span>
+        <span><i class="sw testing"></i>در حال تست</span>
+        <span><i class="sw suspended"></i>معلق (خارج جایگزین شده)</span>
+        <span><i class="sw pending"></i>ساخته نشده</span>
+        <span class="sep"></span>
+        <span><i class="flow"></i>مسیر فعال ترافیک</span>
+        <label class="toggle-inline"><input type="checkbox" id="show-standby" checked> نمایش مسیرهای رزرو</label>
+      </div>
+      <div class="topo-scroll">
+        <div class="topo" id="topo" dir="ltr">
+          <svg class="wires" id="wires"></svg>
+          <div class="col" id="col-kharej"><h3 dir="rtl">🌍 سرورهای خارج</h3><div class="nodes"></div></div>
+          <div class="col" id="col-iran"><h3 dir="rtl">🏠 سرورهای داخل</h3><div class="nodes"></div></div>
+          <div class="col" id="col-domain"><h3 dir="rtl">🌐 دامنه‌ها</h3><div class="nodes"></div></div>
+        </div>
+      </div>
+      <div id="onboard" class="onboard hidden"></div>
+    </section>
+
+    <section class="lower">
+      <div class="panel matrix-panel">
+        <div class="panel-head"><h3>ماتریس اتصال</h3><span class="muted small">هر خانه = تانل بین یک خارج و یک داخل — برای جزئیات کلیک کنید</span></div>
+        <div class="matrix-wrap"><table class="matrix" id="matrix"></table></div>
+      </div>
+      <div class="panel events-panel">
+        <div class="panel-head">
+          <h3>رویدادها</h3>
+          <div class="seg" id="ev-filter">
+            <button data-f="all" class="on">همه</button>
+            <button data-f="error">خطا</button>
+            <button data-f="warning">هشدار</button>
+            <button data-f="success">موفق</button>
+          </div>
+        </div>
+        <ol class="events" id="events"></ol>
+      </div>
+    </section>
+  </main>
+
+  <aside class="drawer" id="drawer"><div class="drawer-inner" id="drawer-body"></div></aside>
+  <div class="scrim" id="scrim"></div>
+  <div class="modal" id="modal"><form class="modal-card" id="modal-form"></form></div>
+  <div class="tip" id="tip"></div>
+  <div class="toasts" id="toasts"></div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
