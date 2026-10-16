@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .backpack import listen_ports
 from .models import (
     IRAN,
     KHAREJ,
@@ -72,13 +73,21 @@ class Store:
                 link.built = True
             if link.status == "suspended":
                 link.status = L_PENDING if not link.transport else "down"
+        # v0.2 domains followed one tunnel: take its Iran server and ports
+        for d in self.domains.values():
+            link = self.links.get(d.link_id)
+            if link and not d.iran_id:
+                d.iran_id = link.iran_id
+                if not d.ports:
+                    d.ports = list(link.ports)
         # v0.1 domains pointed at an Iran server rather than a tunnel
         for raw_d in raw.get("domains", []):
             d = self.domains.get(raw_d.get("id", ""))
-            if d and not d.link_id and d.kharej_id and raw_d.get("iran_id"):
-                link = self.link_for(raw_d["iran_id"], d.kharej_id)
+            if d and raw_d.get("iran_id") and not d.ports:
+                d.iran_id = raw_d["iran_id"]
+                link = self.link_for(raw_d["iran_id"], d.kharej_id) if d.kharej_id else None
                 if link:
-                    d.link_id = link.id
+                    d.ports = list(link.ports)
 
     def save(self) -> None:
         if not self.path:
@@ -209,17 +218,52 @@ class Store:
         return removed
 
     # ---- domains -----------------------------------------------------
+    # ---- ports and routes ----------------------------------------------
+    def port_map(self, iran_id: str) -> dict[int, Link]:
+        """Which link exposes each forwarded port on an Iran server right now
+        (a port can only be bound once per server, so this is unambiguous)."""
+        out: dict[int, Link] = {}
+        for x in self.links.values():
+            if x.iran_id == iran_id and x.status != L_PENDING:
+                for p in listen_ports(self.link_ports(x)):
+                    out.setdefault(p, x)
+        return out
+
+    def owner(self, iran_id: str, spec: str) -> Link | None:
+        """The link whose own port list holds this port (handover or not)."""
+        port = first_port(spec)
+        for x in self.links.values():
+            if x.iran_id == iran_id and port in listen_ports(x.ports):
+                return x
+        return None
+
+    def domain_specs(self, d: Domain) -> list[str]:
+        if d.ports:
+            return list(d.ports)
+        if d.kharej_id and d.iran_id:
+            out: list[str] = []
+            for x in self.links_between(d.iran_id, d.kharej_id):
+                out += [p for p in x.ports if p not in out]
+            return out
+        return []
+
     def group_of(self, d: Domain) -> list[Link]:
         """The tunnels a domain may use, most preferred first."""
         if d.group:
             return [self.links[x] for x in d.group if x in self.links]
-        if not d.kharej_id:
-            return [self.links[d.link_id]] if d.link_id in self.links else []
         prio = {s.id: (s.priority, s.name) for s in self.servers.values()}
-        own = [x for x in self.links.values() if x.kharej_id == d.kharej_id]
+        wanted = set()
+        for spec in self.domain_specs(d):
+            wanted |= listen_ports([spec])
+        kharejs = {d.kharej_id} if d.kharej_id else set()
+        if d.iran_id:  # the kharejs the domain's ports reach today
+            pm = self.port_map(d.iran_id)
+            kharejs |= {pm[p].kharej_id for p in wanted if p in pm}
+        own = [x for x in self.links.values() if x.kharej_id in kharejs or (wanted & listen_ports(x.ports))]
         own.sort(key=lambda x: (prio.get(x.iran_id, (999, "")), x.priority, x.id))
         # when the kharej itself is gone, other kharejs can stand in
-        others = [x for x in self.links.values() if x.kharej_id != d.kharej_id]
+        own_ids = {x.id for x in own}
+        others = [x for x in self.links.values() if x.id not in own_ids]
         others.sort(key=lambda x: (prio.get(x.kharej_id, (999, "")), prio.get(x.iran_id, (999, "")), x.priority, x.id))
         # tunnels not built yet go last: never the primary, only a last resort to build
         ordered = own + others
@@ -228,6 +272,14 @@ class Store:
     def primary_of(self, d: Domain) -> Link | None:
         g = self.group_of(d)
         return g[0] if g else None
+
+    def iran_order(self, d: Domain) -> list[str]:
+        """Iran servers in the order the domain's group prefers them."""
+        out: list[str] = []
+        for x in self.group_of(d):
+            if x.status != L_PENDING and x.iran_id not in out:
+                out.append(x.iran_id)
+        return out
 
     def snapshot(self) -> dict[str, Any]:
         """What the dashboard renders. Secrets are masked."""
@@ -243,10 +295,15 @@ class Store:
         domains = []
         for d in self.domains.values():
             dd = d.to_dict()
-            dd["carrier_id"] = self.carrier(d.link_id) if d.link_id else ""
             dd["effective_group"] = [x.id for x in self.group_of(d)]
-            p = self.primary_of(d)
-            dd["primary_id"] = p.id if p else ""
+            dd["specs"] = self.domain_specs(d)
+            order = self.iran_order(d)
+            dd["primary_iran"] = order[0] if order else ""
+            pm = self.port_map(d.iran_id) if d.iran_id else {}
+            dd["routes"] = [
+                {"spec": spec, "link_id": pm[first_port(spec)].id if first_port(spec) in pm else ""}
+                for spec in dd["specs"]
+            ]
             domains.append(dd)
         return {
             "servers": [s.public() for s in self.servers.values()],
@@ -257,3 +314,7 @@ class Store:
             "layout": self.layout,
         }
 
+
+def first_port(spec: str) -> int:
+    ports = listen_ports([spec])
+    return min(ports) if ports else -1

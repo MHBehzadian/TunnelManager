@@ -133,9 +133,15 @@ class DomainIn(BaseModel):
     fqdn: str = Field(min_length=3)
     provider_id: str
     kharej_id: str = ""
+    ports: list[str] = []
     group: list[str] = []
     ttl: int = Field(120, ge=60, le=86400)
     auto_failover: bool = True
+
+    @field_validator("ports")
+    @classmethod
+    def _p(cls, v):
+        return _ports(v)
 
 
 class TransportIn(BaseModel):
@@ -144,7 +150,7 @@ class TransportIn(BaseModel):
 
 
 class SwitchIn(BaseModel):
-    link_id: str
+    iran_id: str
 
 
 class DiscoverIn(BaseModel):
@@ -289,6 +295,10 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         settings = store.settings.to_dict()
         tg = store.settings.tg()
         settings["telegram"] = {**tg.to_dict(), "bot_token": MASK if tg.bot_token else ""}
+        for dd in st["domains"]:
+            d = store.domains.get(dd["id"])
+            if d:
+                dd.update(orch.domain_info(d))
         return {
             **st,
             "settings": settings,
@@ -388,7 +398,7 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         srv = get(store.servers, sid)
         def uses(d: Domain) -> bool:
             in_group = any(sid in (x.iran_id, x.kharej_id) for x in (store.links.get(i) for i in d.group) if x)
-            return d.kharej_id == sid or in_group
+            return d.kharej_id == sid or d.iran_id == sid or in_group
 
         if any(uses(d) for d in store.domains.values()):
             raise HTTPException(409, "اول دامنه‌های متصل به این سرور را حذف یا ویرایش کنید")
@@ -565,8 +575,6 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         p = get(store.providers, body.provider_id)
         if body.kharej_id and get(store.servers, body.kharej_id).role != KHAREJ:
             raise HTTPException(400, "kharej_id must be a kharej server")
-        if not body.kharej_id and not body.group:
-            raise HTTPException(400, "یک سرور خارج یا گروهی از تانل‌ها انتخاب کنید")
         for lid in body.group:
             get(store.links, lid)
         try:
@@ -591,6 +599,7 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         d.fqdn = body.fqdn.strip().rstrip(".").lower()
         d.provider_id, d.kharej_id, d.ttl, d.auto_failover = body.provider_id, body.kharej_id, body.ttl, body.auto_failover
         d.group = list(body.group)
+        d.ports = list(body.ports)
         await orch.changed()
         orch.wake()
         return {"domain": d.to_dict()}
@@ -605,8 +614,10 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
     @app.post("/api/domains/{did}/switch", dependencies=A)
     async def switch(did: str, body: SwitchIn):
         d = get(store.domains, did)
-        link = get(store.links, body.link_id)
-        ok = await orch.move_domain(d, link, "انتقال دستی از پنل")
+        iran = get(store.servers, body.iran_id)
+        if iran.role != IRAN:
+            raise HTTPException(400, "not an Iran server")
+        ok = await orch.move_domain(d, iran.id, "انتقال دستی از پنل")
         if not ok:
             raise HTTPException(502, d.error or "switch failed")
         await orch.changed()

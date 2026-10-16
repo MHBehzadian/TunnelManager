@@ -180,12 +180,17 @@ def seed(store: Store, net: SimNet) -> None:
         ar = DNSProvider(name="Arvan", kind="arvan", api_token="demo", zone="example.ir")
         st.providers[cf.id], st.providers[ar.id] = cf, ar
         kh, ir = st.kharejs(), st.irans()
-        for fqdn, prov, k in (
-            ("vpn.example.ir", ar, kh[0]), ("panel.example.com", cf, kh[0]), ("cdn.example.ir", ar, kh[1]),
-            ("game.example.com", cf, kh[2]),
+        # records as they are today: each points at one Iran server
+        for fqdn, prov, k, ports, iran in (
+            ("vpn.example.ir", ar, kh[0], [], ir[0]),
+            ("cdn.example.ir", ar, kh[1], [], ir[2]),
+            ("game.example.com", cf, kh[2], [], ir[1]),
+            # one domain, two ports, two kharejs: 443 -> Hetzner, 2053 -> OVH
+            ("multi.example.ir", ar, None, ["443", "2053"], ir[0]),
         ):
-            d = Domain(fqdn=fqdn, provider_id=prov.id, kharej_id=k.id)
+            d = Domain(fqdn=fqdn, provider_id=prov.id, kharej_id=k.id if k else "", ports=ports, current_ip=iran.ip)
             st.domains[d.id] = d
+            SimDNS.records[fqdn] = iran.ip
         st.save()
     kh, ir = st.kharejs(), st.irans()
     if len(kh) >= 3 and len(ir) >= 3:
@@ -195,6 +200,8 @@ def seed(store: Store, net: SimNet) -> None:
         net.plant(ir[0], kh[1], "ovh-teh", "tcp", 3081, ["2053", "2083"])
         net.plant(ir[2], kh[1], "ovh-mhd", "quic", 3080, ["2053", "2083"])
         net.plant(ir[1], kh[2], "contabo-shz", "kcp", 3081, ["2087"])
+        net.plant(ir[1], kh[1], "ovh-shz", "tcpmux", 3082, ["2053", "2083"])
+        net.plant(ir[2], kh[2], "contabo-mhd", "wsmux", 3081, ["2087"])
 
 
 async def chaos(orch, net: SimNet) -> None:

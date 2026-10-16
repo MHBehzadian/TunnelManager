@@ -78,7 +78,7 @@ function linkCell(l, extra = "") {
 }
 function activeLinkIds() {
   const set = new Set();
-  for (const d of S.domains) if (d.carrier_id) set.add(d.carrier_id);
+  for (const d of S.domains) for (const r of d.routes || []) if (r.link_id) set.add(r.link_id);
   return set;
 }
 function ago(ts) {
@@ -216,7 +216,7 @@ setInterval(() => {
   $("#last-check").textContent = S.last_check ? `بررسی: ${ago(S.last_check)}` : "در انتظار اولین بررسی";
   if (drawer && drawer.type === "domain") {
     const el = $("#failback-timer");
-    if (el) el.textContent = failbackText(S.domains.find((x) => x.id === drawer.id));
+    if (el) el.textContent = failbackText(S.domains.find((x) => x.id === drawer.id)) || "";
   }
 }, 1000);
 
@@ -273,7 +273,7 @@ function serverCard(s) {
   const meta = [`<span class="chip">${up}/${links.length} تانل</span>`];
   if (s.ssh_latency_ms != null) meta.push(`<span class="chip mono" title="تأخیر SSH از پنل">ssh ${ms(s.ssh_latency_ms)}</span>`);
   if (s.role === "iran") {
-    const doms = S.domains.filter((d) => { const l = linkById(d.link_id); return l && l.iran_id === s.id; }).length;
+    const doms = S.domains.filter((d) => d.iran_id === s.id).length;
     if (doms) meta.push(`<span class="chip info">${doms} دامنه</span>`);
   }
   return {
@@ -285,11 +285,16 @@ function serverCard(s) {
 
 function domainCard(d) {
   const p = provider(d.provider_id);
-  const carrier = linkById(d.carrier_id);
-  const onPrimary = d.link_id && d.link_id === d.primary_id && d.carrier_id === d.link_id;
   const meta = [];
-  if (carrier) meta.push(`<span class="chip">${esc(nm(carrier.iran_id))} ⇄ ${esc(nm(carrier.kharej_id))}</span>`);
-  if (d.link_id && !onPrimary) meta.push(`<span class="chip warn">جایگزین</span>`);
+  if (d.iran_id) meta.push(`<span class="chip">${esc(nm(d.iran_id))}</span>`);
+  const routes = d.routes || [];
+  for (const r of routes.slice(0, 4)) {
+    const l = linkById(r.link_id);
+    meta.push(`<span class="chip mono ${r.healthy ? "" : "bad"}" title="${esc(l ? linkName(l) : "بدون تانل")}">${esc(r.spec)}→${esc(l ? nm(l.kharej_id) : "؟")}</span>`);
+  }
+  if (routes.length > 4) meta.push(`<span class="chip">+${routes.length - 4}</span>`);
+  if (!routes.length && d.iran_id) meta.push(`<span class="chip warn">پورت مشخص نشده</span>`);
+  if (d.iran_id && d.primary_iran && d.iran_id !== d.primary_iran) meta.push(`<span class="chip warn">جایگزین</span>`);
   if (d.pending_ip) meta.push(`<span class="chip warn">در انتظار DNS</span>`);
   if (!d.auto_failover) meta.push(`<span class="chip">دستی</span>`);
   if (d.error) meta.push(`<span class="chip bad" title="${esc(d.error)}">خطا</span>`);
@@ -305,7 +310,7 @@ function renderCanvas() {
   for (const s of byRole("kharej")) items.push(["kharej", s.id, serverCard(s)]);
   for (const s of byRole("iran")) items.push(["iran", s.id, serverCard(s)]);
   const iranRank = Object.fromEntries(byRole("iran").map((s, i) => [s.id, i]));
-  const rank = (d) => { const h = linkById(d.link_id); return h ? iranRank[h.iran_id] ?? 99 : 99; };
+  const rank = (d) => iranRank[d.iran_id] ?? 99;
   for (const d of [...S.domains].sort((a, b) => rank(a) - rank(b) || a.fqdn.localeCompare(b.fqdn))) items.push(["domain", d.id, domainCard(d)]);
   const seen = new Set();
   for (const [col, id, card] of items) {
@@ -408,11 +413,10 @@ function drawWiresNow() {
     edges.push({ kind: "link", l, from: l.kharej_id, to: l.iran_id, a, b, st, act: active.has(l.id), standby });
   }
   for (const d of S.domains) {
-    const home = linkById(d.link_id);
-    if (!home) continue;
-    const a = box(home.iran_id), b = box(d.id);
+    if (!d.iran_id) continue;
+    const a = box(d.iran_id), b = box(d.id);
     if (!a || !b) continue;
-    edges.push({ kind: "domain", d, from: home.iran_id, to: d.id, a, b });
+    edges.push({ kind: "domain", d, from: d.iran_id, to: d.id, a, b });
   }
   // spread the anchor points along each node side, ordered by the far end
   const sides = {};
@@ -577,16 +581,16 @@ function relatedTo(type, id) {
   const addLink = (l) => { if (!l) return; links.add(l.id); nodes.add(l.iran_id); nodes.add(l.kharej_id); };
   if (type === "domain") {
     const d = S.domains.find((x) => x.id === id);
-    if (d) { domains.add(d.id); addLink(linkById(d.carrier_id)); const h = linkById(d.link_id); if (h) nodes.add(h.iran_id); }
+    if (d) { domains.add(d.id); if (d.iran_id) nodes.add(d.iran_id); for (const r of d.routes || []) addLink(linkById(r.link_id)); }
   } else if (type === "server") {
     for (const l of S.links) if (l.iran_id === id || l.kharej_id === id) addLink(l);
     for (const d of S.domains) {
-      const c = linkById(d.carrier_id), h = linkById(d.link_id);
-      if ((c && (c.iran_id === id || c.kharej_id === id)) || (h && h.iran_id === id)) { domains.add(d.id); nodes.add(d.id); }
+      const via = (d.routes || []).map((r) => linkById(r.link_id)).filter(Boolean);
+      if (d.iran_id === id || via.some((l) => l.kharej_id === id)) { domains.add(d.id); nodes.add(d.id); }
     }
   } else if (type === "link") {
     addLink(linkById(id));
-    for (const d of S.domains) if (d.carrier_id === id) { domains.add(d.id); nodes.add(d.id); }
+    for (const d of S.domains) if ((d.routes || []).some((r) => r.link_id === id)) { domains.add(d.id); nodes.add(d.id); }
   }
   return { nodes, links, domains };
 }
@@ -700,7 +704,7 @@ function linkDrawer() {
   const l = linkById(drawer.id);
   if (!l) return "";
   const st = lstatus(l);
-  const doms = S.domains.filter((d) => d.carrier_id === l.id);
+  const doms = S.domains.filter((d) => (d.routes || []).some((r) => r.link_id === l.id));
   const cand = S.settings.candidate_transports;
   const all = [...cand, ...S.transports.filter((t) => !cand.includes(t))];
   const sel = selTransport || l.transport;
@@ -787,66 +791,82 @@ function serverDrawer() {
 }
 
 function failbackText(d) {
-  if (!d) return "";
-  const p = linkById(d.primary_id);
-  if (!p || (d.link_id === p.id && d.carrier_id === p.id)) return "";
-  if (!d.auto_failover) return "جابه‌جایی خودکار خاموش است";
-  if (p.status !== "up" || isFlapping(p)) return `تانل اصلی (${linkName(p)}) هنوز سالم نیست`;
-  const since = Math.max(p.last_fail || 0, p.up_since || 0, d.last_switch || 0);
-  const left = S.settings.failback_after - (nowS() - since);
-  return left > 0 ? `برگشت به تانل اصلی بعد از ${dur(left)} پایداری دیگر` : "برگشت به تانل اصلی در بررسی بعدی";
-}
-function autoGroup(d) {
-  // mirrors Store.group_of for the preview: the kharej's tunnels by Iran priority, then the rest
-  const prio = (id) => { const s = srv(id); return s ? [s.priority, s.name] : [999, ""]; };
-  const cmp = (a, b) => { const x = prio(a), y = prio(b); return x[0] - y[0] || x[1].localeCompare(y[1]); };
-  const own = S.links.filter((l) => l.kharej_id === d.kharej_id).sort((a, b) => cmp(a.iran_id, b.iran_id) || a.priority - b.priority);
-  const rest = S.links.filter((l) => l.kharej_id !== d.kharej_id).sort((a, b) => cmp(a.kharej_id, b.kharej_id) || cmp(a.iran_id, b.iran_id) || a.priority - b.priority);
-  const all = [...own, ...rest];
-  return [...all.filter((l) => l.status !== "pending"), ...all.filter((l) => l.status === "pending")].map((l) => l.id);
+  if (!d || !d.failback) return "";
+  const f = d.failback, name = nm(f.iran_id);
+  if (f.wait < 0) return `سرور اصلی ${name} هنوز همه پورت‌های این دامنه را سالم ندارد`;
+  const left = f.wait - (nowS() - S.now);
+  return left > 0 ? `برگشت به سرور اصلی ${name} بعد از ${dur(left)} پایداری دیگر` : `برگشت به سرور اصلی ${name} در بررسی بعدی`;
 }
 function domainDrawer() {
   const d = S.domains.find((x) => x.id === drawer.id);
   if (!d) return "";
   const p = provider(d.provider_id);
-  const home = linkById(d.link_id), carrier = linkById(d.carrier_id), primary = linkById(d.primary_id);
+  const iran = srv(d.iran_id);
+  // 1. per-port routes on the Iran server the record points at
+  const routeRows = (d.routes || []).map((r) => {
+    const l = linkById(r.link_id);
+    const st = l ? lstatus(l) : "down";
+    const sub = l ? [l.label, l.transport, st === "up" ? ms(l.latency_ms) : FA[st]].filter(Boolean).join(" · ") : "هیچ تانلی این پورت را روی این سرور باز نکرده";
+    return `<div class="opt"><span class="dot ${r.healthy ? "up" : st}"></span>
+      <span class="grow"><span dir="ltr" style="text-align:right"><span class="mono">${esc(r.spec)}</span> → ${esc(l ? nm(l.kharej_id) : "؟")}</span><span class="sub mono">${esc(sub)}</span></span>
+      ${l ? `<button class="btn sm" data-link="${l.id}">تانل</button>` : ""}</div>`;
+  }).join("");
+  // 2. which ports this domain uses: pick from what the Iran server exposes
+  const offered = [];
+  for (const l of S.links.filter((x) => x.iran_id === d.iran_id && x.status !== "pending")) {
+    for (const spec of l.ports || []) if (!offered.some((o) => o.spec === spec)) offered.push({ spec, l });
+  }
+  for (const spec of d.specs || []) if (!offered.some((o) => o.spec === spec)) offered.push({ spec, l: null });
+  const picker = offered.map((o) => `<label><input type="checkbox" class="dp-port" value="${esc(o.spec)}" ${(d.specs || []).includes(o.spec) ? "checked" : ""}><span dir="ltr">${esc(o.spec)} <span class="muted small">→ ${esc(o.l ? nm(o.l.kharej_id) : "؟")}</span></span></label>`).join("");
+  // 3. every Iran server: can it carry all of the domain's ports?
+  const cov = (d.coverage || []).map((c) => {
+    const s = srv(c.iran_id);
+    if (!s) return "";
+    const tags = [];
+    if (c.iran_id === d.primary_iran) tags.push(`<span class="chip">اصلی</span>`);
+    if (c.iran_id === d.iran_id) tags.push(`<span class="chip good">فعلی</span>`);
+    const sub = c.ok ? "همه پورت‌ها سالم" : (c.problems[0] || "");
+    return `<div class="opt ${c.ok ? "" : "off"}"><span class="dot ${c.ok ? "up" : "down"}"></span>
+      <span class="grow"><span>${esc(s.name)} <span class="mono muted small">${esc(s.ip)}</span></span><span class="sub">${esc(sub)}${c.problems.length > 1 ? ` (+${c.problems.length - 1})` : ""}</span></span>
+      ${tags.join("")}${c.ok && c.iran_id !== d.iran_id ? `<button class="btn sm" data-switch="${c.iran_id}">انتقال</button>` : ""}</div>`;
+  }).join("");
+  // 4. allowed tunnels (advanced)
   const manual = groupDraft ? groupDraft.manual : d.group.length > 0;
   const notPending = (id) => (linkById(id) || {}).status !== "pending";
-  const order = groupDraft ? (groupDraft.manual ? groupDraft.ids : autoGroup(d).filter(notPending)) : (manual ? d.effective_group : d.effective_group.filter(notPending));
-  const listed = manual ? [...order, ...S.links.map((l) => l.id).filter((id) => !order.includes(id))] : order;
-  const rows = listed.map(linkById).filter(Boolean).map((l, i) => {
+  const order = groupDraft ? (groupDraft.manual ? groupDraft.ids : []) : d.effective_group.filter(manual ? () => true : notPending);
+  const listed = manual ? [...order, ...S.links.filter((l) => l.status !== "pending").map((l) => l.id).filter((id) => !order.includes(id))] : order;
+  const groupRows = listed.map(linkById).filter(Boolean).map((l, i) => {
     const on = order.includes(l.id);
-    const st = lstatus(l);
-    const healthy = st === "up" && !isFlapping(l);
-    const tags = [];
-    if (on && order[0] === l.id) tags.push(`<span class="chip">اصلی</span>`);
-    if (l.id === d.carrier_id) tags.push(`<span class="chip good">فعلی</span>`);
     return `<div class="opt ${on ? "" : "off"}">
       ${manual ? `<input type="checkbox" data-g-toggle="${l.id}" ${on ? "checked" : ""}>` : `<span class="muted small mono">${i + 1}</span>`}
-      <span class="dot ${st}"></span>${linkCell(l)}
-      ${tags.join("")}
-      ${manual && on ? `<span class="ord"><button type="button" data-g-up="${l.id}" title="بالاتر">▲</button><button type="button" data-g-down="${l.id}" title="پایین‌تر">▼</button></span>` : ""}
-      ${!groupDraft && on && l.id !== d.carrier_id && healthy ? `<button class="btn sm" data-switch="${l.id}">انتقال</button>` : ""}</div>`;
+      <span class="dot ${lstatus(l)}"></span>${linkCell(l)}
+      ${manual && on ? `<span class="ord"><button type="button" data-g-up="${l.id}" title="بالاتر">▲</button><button type="button" data-g-down="${l.id}" title="پایین‌تر">▼</button></span>` : ""}</div>`;
   }).join("");
-  const iran = home ? srv(home.iran_id) : null;
   const fb = failbackText(d);
   return `${head(`<span class="mono">${esc(d.fqdn)}</span>`, `${p ? `<span class="prov ${p.kind}">${p.kind === "cloudflare" ? "Cloudflare" : "ArvanCloud"}</span> ${esc(p.name)}` : "بدون حساب DNS"}`, d.status)}
   <div class="box"><h4>مسیر ترافیک</h4>
-    <div class="path"><span class="chip">کاربر</span><span class="arrow">→</span><span class="chip mono">${esc(d.fqdn)}</span><span class="arrow">→</span>
-    <span class="chip">${esc(iran ? iran.name : "—")}</span><span class="arrow">⇄</span><span class="chip">${esc(carrier ? nm(carrier.kharej_id) : "—")}</span></div>
-    ${carrier ? `<p class="note">تانل در حال استفاده: <b>${esc(linkName(carrier))}${esc(linkTag(carrier))}</b> با <span class="mono">${esc(carrier.transport)}</span>${home && carrier.id !== home.id ? ` — پورت‌های ${esc(linkName(home))} به آن منتقل شده` : ""}</p>` : `<p class="note">هنوز تانلی برای این دامنه انتخاب نشده.</p>`}
+    <div class="path"><span class="chip">کاربر</span><span class="arrow">→</span><span class="chip mono">${esc(d.fqdn)}</span><span class="arrow">→</span><span class="chip">${esc(iran ? `${iran.name} ${iran.ip}` : "—")}</span></div>
+    ${iran ? "" : `<p class="note" style="color:var(--degraded)">رکورد این دامنه به هیچ‌کدام از سرورهای داخل ثبت‌شده اشاره نمی‌کند. از لیست «سرورهای داخل» پایین، سرور درست را انتخاب کنید.</p>`}
     ${d.pending_ip ? `<p class="note" style="color:var(--degraded)">رکورد به <span class="mono">${esc(d.pending_ip)}</span> تغییر کرده؛ در انتظار رسیدن تغییر به DNSهای عمومی (${ago(d.pending_since)})…</p>` : ""}
-    ${fb ? `<p class="note">${primary ? `تانل اصلی: <b>${esc(linkName(primary))}</b> — ` : ""}<span id="failback-timer">${esc(fb)}</span></p>` : ""}
+    ${fb ? `<p class="note"><span id="failback-timer">${esc(fb)}</span></p>` : ""}
     <dl class="kv"><dt>آی‌پی رکورد</dt><dd class="mono">${esc(d.current_ip || "—")}</dd><dt>TTL</dt><dd class="mono">${d.ttl}s</dd>
     <dt>آخرین جابه‌جایی</dt><dd>${ago(d.last_switch)}</dd><dt>جابه‌جایی خودکار</dt><dd>${d.auto_failover ? "فعال" : "غیرفعال"}</dd>
     ${d.error ? `<dt>خطا</dt><dd style="color:var(--down)">${esc(d.error)}</dd>` : ""}</dl>
     <div class="btns"><button class="btn sm" data-edit-domain="${d.id}">ویرایش</button><button class="btn sm" data-sync="${d.id}">خواندن رکورد از DNS</button><button class="btn sm danger" data-del-domain="${d.id}">حذف</button></div></div>
-  <div class="box"><h4>گروه تانل‌های این دامنه</h4>
-    <p class="note">اگر تانل فعلی قطع شود یا مدام قطع و وصل شود، دامنه فوراً به اولین تانل سالمِ این لیست منتقل می‌شود؛ بقیه تانل‌ها همیشه وصل و آماده‌اند. اولی «اصلی» است و بعد از ${Math.round(S.settings.failback_after / 60)} دقیقه پایداری کامل، ترافیک به آن برمی‌گردد.</p>
+  ${iran ? `<div class="box"><h4>پورت‌ها و مسیرها روی ${esc(iran.name)}</h4>
+    <div class="opt-list">${routeRows || "<span class='muted small'>هنوز پورتی برای این دامنه انتخاب نشده</span>"}</div>
+    <label>این دامنه از کدام پورت‌ها استفاده می‌کند؟</label>
+    <div class="tchecks">${picker || "<span class='muted small'>روی این سرور تانلی با پورت فورواردی نیست</span>"}</div>
+    <p class="hint">دامنه فقط وقتی سالم حساب می‌شود که همه این پورت‌ها کار کنند، و فقط به سرور داخلی منتقل می‌شود که همه‌شان را سالم داشته باشد.</p>
+    <div class="btns"><button class="btn primary sm" data-save-dports="${d.id}">ذخیره پورت‌ها</button></div></div>` : ""}
+  <div class="box"><h4>سرورهای داخل</h4>
+    <p class="note">در قطعی، رکورد به اولین سروری از این لیست می‌رود که <b>همه پورت‌های دامنه</b> را سالم دارد. «اصلی» بعد از ${Math.round(S.settings.failback_after / 60)} دقیقه پایداری کامل دوباره پشت دامنه می‌آید.</p>
+    <div class="opt-list">${cov || "<span class='muted small'>—</span>"}</div></div>
+  <div class="box"><h4>پیشرفته: تانل‌های مجاز و ترتیب</h4>
     <div class="seg"><button type="button" data-g-mode="auto" class="${manual ? "" : "on"}">خودکار</button><button type="button" data-g-mode="manual" class="${manual ? "on" : ""}">انتخاب دستی</button></div>
-    ${manual ? `<p class="hint">تیک بزنید کدام تانل‌ها در گروه باشند و با ▲▼ ترتیب را مشخص کنید.</p>` : `<p class="hint">خودکار: تانل‌های ${esc(nm(d.kharej_id))} به ترتیب اولویت سرورهای داخل؛ اگر خودِ این خارج از کار بیفتد، تانل خارج‌های دیگر روی همان سرور داخل.</p>`}
-    <div class="opt-list">${rows || "<span class='muted small'>تانلی وجود ندارد</span>"}</div>
-    ${groupDraft ? `<div class="btns"><button class="btn primary sm" data-g-save="${d.id}">ذخیره گروه</button><button class="btn sm ghost" data-g-cancel>انصراف</button></div>` : ""}
+    <p class="hint">${manual ? "فقط تانل‌های تیک‌خورده برای این دامنه استفاده می‌شوند؛ ترتیب آن‌ها ترتیب سرورهای داخل را هم تعیین می‌کند." : "خودکار: همه تانل‌هایی که پورت‌های این دامنه را دارند، به ترتیب اولویت سرورهای داخل؛ و اگر خارجی از کار بیفتد، تانل خارج‌های دیگر روی همان سرور داخل."}</p>
+    <div class="opt-list">${groupRows || (groupDraft ? "<span class='muted small'>بعد از ذخیره به‌صورت خودکار محاسبه می‌شود</span>" : "")}</div>
+    ${groupDraft ? `<div class="btns"><button class="btn primary sm" data-g-save="${d.id}">ذخیره</button><button class="btn sm ghost" data-g-cancel>انصراف</button></div>` : ""}
   </div>`;
 }
 
@@ -937,16 +957,17 @@ function domainForm(d) {
   if (!S.providers.length) { toast("اول یک حساب DNS اضافه کنید"); return providerForm(); }
   if (!byRole("kharej").length) { toast("اول سرورها را اضافه کنید"); return serverForm("kharej"); }
   const edit = !!d;
-  d = d || { fqdn: "", provider_id: S.providers[0].id, kharej_id: byRole("kharej")[0].id, ttl: 120, auto_failover: true, group: [] };
+  d = d || { fqdn: "", provider_id: S.providers[0].id, kharej_id: "", ports: [], ttl: 120, auto_failover: true, group: [] };
   openModal(`<h2>${edit ? "ویرایش" : "افزودن"} دامنه</h2>
     <label>دامنه<input name="fqdn" required class="mono" value="${esc(d.fqdn)}" placeholder="sub.example.ir"></label>
     <div class="grid2"><label>حساب DNS<select name="provider_id">${S.providers.map((p) => `<option value="${p.id}" ${p.id === d.provider_id ? "selected" : ""}>${esc(p.name)} (${esc(p.zone)})</option>`).join("")}</select></label>
-    <label>سرویس روی کدام خارج است؟<select name="kharej_id"><option value="">— (فقط گروه دستی)</option>${byRole("kharej").map((k) => `<option value="${k.id}" ${k.id === d.kharej_id ? "selected" : ""}>${esc(k.name)}</option>`).join("")}</select></label></div>
+    <label>سرور خارج (اختیاری)<select name="kharej_id"><option value="">— پورت‌ها را خودم مشخص می‌کنم</option>${byRole("kharej").map((k) => `<option value="${k.id}" ${k.id === d.kharej_id ? "selected" : ""}>${esc(k.name)}</option>`).join("")}</select></label></div>
+    <label>پورت‌های این دامنه (اختیاری)<input name="ports" class="mono" value="${esc((d.ports || []).join(", "))}" placeholder="443, 2053"></label>
+    <p class="hint">پورت‌هایی که کاربرها با این دامنه به آن‌ها وصل می‌شوند. هر پورت می‌تواند به یک خارج متفاوت برود. خالی بگذارید تا بعد از خواندن رکورد، در پنل دامنه از روی تانل‌های همان سرور داخل تیک بزنید (یا اگر خارج را انتخاب کرده‌اید، پورت‌های تانل‌های همان خارج استفاده شود).</p>
     <div class="grid2"><label>TTL (ثانیه)<input name="ttl" type="number" min="60" value="${d.ttl}"></label>
     <label class="check" style="align-self:end"><input type="checkbox" name="auto_failover" ${d.auto_failover ? "checked" : ""}> جابه‌جایی خودکار در قطعی</label></div>
-    <p class="hint">آی‌پی پشت دامنه همیشه یکی از سرورهای داخل است. گروه تانل‌ها (کدام تانل‌ها و به چه ترتیبی) را بعد از ذخیره در پنل دامنه تنظیم کنید.</p>
     ${actions(edit ? "ذخیره" : "افزودن")}`, async (f) => {
-    const body = { fqdn: f.get("fqdn"), provider_id: f.get("provider_id"), kharej_id: f.get("kharej_id"), ttl: +f.get("ttl") || 120, auto_failover: !!f.get("auto_failover"), group: d.group || [] };
+    const body = { fqdn: f.get("fqdn"), provider_id: f.get("provider_id"), kharej_id: f.get("kharej_id"), ports: lines(f.get("ports")), ttl: +f.get("ttl") || 120, auto_failover: !!f.get("auto_failover"), group: d.group || [] };
     if (edit) await api("PUT", `/api/domains/${d.id}`, body);
     else { const r = await api("POST", "/api/domains", body); setTimeout(() => openDrawer("domain", r.domain.id), 300); }
     toast("ذخیره شد", "success");
@@ -1023,11 +1044,14 @@ function addFlow(kind) {
   else if (kind === "domain") domainForm();
   else if (kind === "link") linkForm();
 }
-function saveDomainGroup(dom, group) {
-  return api("PUT", `/api/domains/${dom.id}`, { fqdn: dom.fqdn, provider_id: dom.provider_id, kharej_id: dom.kharej_id, ttl: dom.ttl, auto_failover: dom.auto_failover, group });
+function saveDomain(dom, patch) {
+  return api("PUT", `/api/domains/${dom.id}`, {
+    fqdn: dom.fqdn, provider_id: dom.provider_id, kharej_id: dom.kharej_id, ports: dom.ports || [],
+    ttl: dom.ttl, auto_failover: dom.auto_failover, group: dom.group || [], ...patch,
+  });
 }
 
-const CLICKABLE = "[data-add],[data-close],[data-close-modal],[data-link],[data-pick],[data-apply-transport],[data-retest],[data-unpin],[data-edit-server],[data-test-server],[data-install],[data-del-server],[data-scan],[data-new-link],[data-release],[data-save-ports],[data-save-link],[data-del-link],[data-discover-links],[data-switch],[data-sync],[data-edit-domain],[data-del-domain],[data-verify-provider],[data-edit-provider],[data-del-provider],[data-g-mode],[data-g-toggle],[data-g-up],[data-g-down],[data-g-save],[data-g-cancel]";
+const CLICKABLE = "[data-add],[data-close],[data-close-modal],[data-link],[data-pick],[data-apply-transport],[data-retest],[data-unpin],[data-edit-server],[data-test-server],[data-install],[data-del-server],[data-scan],[data-new-link],[data-release],[data-save-ports],[data-save-link],[data-del-link],[data-discover-links],[data-switch],[data-save-dports],[data-sync],[data-edit-domain],[data-del-domain],[data-verify-provider],[data-edit-provider],[data-del-provider],[data-g-mode],[data-g-toggle],[data-g-up],[data-g-down],[data-g-save],[data-g-cancel]";
 document.addEventListener("click", async (e) => {
   const t = e.target.closest(CLICKABLE);
   if (!t) {
@@ -1079,13 +1103,21 @@ document.addEventListener("click", async (e) => {
   if (d.discoverLinks) return act(() => api("POST", "/api/discover", { link_ids: d.discoverLinks.split(",") }), "ساخت تانل‌ها شروع شد");
   if (d.switch) {
     const dom = S.domains.find((x) => x.id === drawer.id);
-    if (!confirm(`دامنه ${dom.fqdn} به تانل ${linkName(linkById(d.switch))} منتقل شود؟`)) return;
-    return act(() => api("POST", `/api/domains/${dom.id}/switch`, { link_id: d.switch }), "انتقال انجام شد");
+    const s = srv(d.switch);
+    if (!confirm(`رکورد ${dom.fqdn} در DNS به ${s.name} (${s.ip}) تغییر کند؟`)) return;
+    return act(() => api("POST", `/api/domains/${dom.id}/switch`, { iran_id: d.switch }), "رکورد تغییر کرد");
+  }
+  if (d.saveDports) {
+    const dom = S.domains.find((x) => x.id === d.saveDports);
+    const ports = $$(".dp-port").filter((x) => x.checked).map((x) => x.value);
+    if (!ports.length) return toast("حداقل یک پورت انتخاب کنید", "error");
+    return act(() => saveDomain(dom, { ports }), "پورت‌های دامنه ذخیره شد");
   }
   if (d.gMode) {
     const dom = S.domains.find((x) => x.id === drawer.id);
     const built = dom.effective_group.filter((id) => (linkById(id) || {}).status !== "pending");
     groupDraft = d.gMode === "manual" ? { manual: true, ids: dom.group.length ? [...dom.group] : built } : { manual: false, ids: [] };
+    if (d.gMode === "auto" && !dom.group.length) groupDraft = null;
     return renderDrawer(true);
   }
   if (d.gToggle) {
@@ -1103,8 +1135,7 @@ document.addEventListener("click", async (e) => {
     const dom = S.domains.find((x) => x.id === d.gSave);
     const group = groupDraft.manual ? groupDraft.ids : [];
     if (groupDraft.manual && !group.length) return toast("حداقل یک تانل انتخاب کنید", "error");
-    if (!groupDraft.manual && !dom.kharej_id) return toast("برای حالت خودکار، در ویرایش دامنه یک سرور خارج انتخاب کنید", "error");
-    await act(() => saveDomainGroup(dom, group), "گروه ذخیره شد");
+    await act(() => saveDomain(dom, { group }), "ذخیره شد");
     groupDraft = null; return renderDrawer(true);
   }
   if (d.sync) return act(() => api("POST", `/api/domains/${d.sync}/sync`), "رکورد خوانده شد");

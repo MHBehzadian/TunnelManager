@@ -190,13 +190,19 @@ class DNSProvider(Model):
 class Domain(Model):
     fqdn: str
     provider_id: str
-    kharej_id: str = ""  # where the service lives; builds the automatic group
+    kharej_id: str = ""  # optional: where the service lives; picks the ports and the automatic group
     id: str = field(default_factory=lambda: new_id("d"))
     # Failover group: the tunnels this domain may use, in order of preference.
     # The first one is the primary the domain returns to once it is stable.
     # Empty = automatic (every tunnel to kharej_id, best Iran server first).
     group: list[str] = field(default_factory=list)
-    link_id: str = ""  # the tunnel whose ports the domain is served from; DNS points at its Iran server
+    # The Iran server the A record points at, and the forwarded ports this
+    # domain's users connect to on it. Each port may be carried by a
+    # different tunnel to a different kharej; the domain is healthy only
+    # when every one of them is.
+    iran_id: str = ""
+    ports: list[str] = field(default_factory=list)  # "443", "2053-2060"; [] = the ports of kharej_id's tunnels
+    link_id: str = ""  # v0.2: the single tunnel a domain used (kept for migration)
     ttl: int = 120
     auto_failover: bool = True
     status: str = UNKNOWN  # ok | broken | unknown

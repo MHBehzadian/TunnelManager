@@ -25,10 +25,9 @@ async def test_observe_mode_reports_but_changes_nothing(world):
     w.store.settings.observe_only = True
     a = next(x for x in w.store.links.values() if x.iran_name == "a")
     # the record already pointed at I1: adopted without touching DNS
-    w.dom.current_ip, w.dom.link_id = w.i1.ip, ""
     FakeDNS.calls.clear()
     await w.settle(1)
-    assert w.dom.link_id == a.id and FakeDNS.calls == []
+    assert w.dom.iran_id == w.i1.id and FakeDNS.calls == []
 
     calls_before = list(w.net.calls)
     w.net.block(w.i1, w.k1, "tcpmux")
@@ -36,7 +35,7 @@ async def test_observe_mode_reports_but_changes_nothing(world):
     assert a.status == L_DOWN
     assert FakeDNS.calls == []  # no DNS change
     assert w.net.calls == calls_before  # no deploy, no restart, no rewrite
-    assert w.dom.link_id == a.id
+    assert w.dom.iran_id == w.i1.id
     proposals = [n for n in w.notes if "حالت نظارت" in n]
     assert len(proposals) == 1 and "تغییر می‌کرد" in proposals[0]
     # it heals by itself: reported once more, still nothing changed
@@ -49,14 +48,14 @@ async def test_observe_mode_reports_but_changes_nothing(world):
 async def test_observe_mode_never_points_a_record_somewhere_new(world):
     w = world
     w.store.settings.observe_only = True
+    w.dom.current_ip = "203.0.113.9"  # an IP the panel does not know
     await w.orch.check_all()
     for x in w.store.links.values():  # pretend they were all running
         x.status, x.transport, x.built = L_UP, "tcpmux", True
         w.net.deployed[x.id] = "tcpmux"
-    w.dom.current_ip = "203.0.113.9"  # an IP the panel does not know
     await w.settle(2)
     assert FakeDNS.calls == []
-    assert w.said("رکورد دست نخورد")
+    assert w.said("رکورد دست نخورد") and w.dom.iran_id == ""
 
 
 async def test_only_running_tunnels_are_adopted_and_their_units_kept(world):

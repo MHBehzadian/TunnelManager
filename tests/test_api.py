@@ -50,7 +50,7 @@ def test_setup_login_and_crud(tmp_path):
         assert d.status_code == 200
         did = d.json()["domain"]["id"]
         assert c.post("/api/domains", json={"fqdn": "a.other.com", "provider_id": p["id"], "kharej_id": sid}).status_code == 400
-        assert c.post("/api/domains", json={"fqdn": "b.example.ir", "provider_id": p["id"]}).status_code == 400
+        assert c.post("/api/domains", json={"fqdn": "b.example.ir", "provider_id": p["id"], "ports": ["443;x"]}).status_code == 422
         assert c.put(f"/api/domains/{did}", json={"fqdn": "a.example.ir", "provider_id": p["id"], "group": [lid]}).status_code == 200
         assert store.domains[did].group == [lid]
 

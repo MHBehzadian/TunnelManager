@@ -33,7 +33,8 @@ class World:
             x.ports = ["443", "8443=2096"] if x.kharej_id == self.k1.id else ["2053"]
         self.prov = DNSProvider(name="ar", kind="arvan", api_token="x", zone="example.ir")
         st.providers[self.prov.id] = self.prov
-        self.dom = Domain(fqdn="a.example.ir", provider_id=self.prov.id, kharej_id=self.k1.id)
+        # the record already points at I1 (read from Arvan when the domain is added)
+        self.dom = Domain(fqdn="a.example.ir", provider_id=self.prov.id, kharej_id=self.k1.id, current_ip=self.i1.ip)
         st.domains[self.dom.id] = self.dom
         self.net = FakeNet()
         self.notes: list[str] = []

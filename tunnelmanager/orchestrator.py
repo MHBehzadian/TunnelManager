@@ -54,7 +54,7 @@ from .models import (
     TestResult,
 )
 from .ssh import SSHError
-from .store import Store
+from .store import Store, first_port
 from .telegram import ICON, esc
 
 log = logging.getLogger(__name__)
@@ -767,20 +767,54 @@ class Orchestrator:
                 link=src_id,
             )
 
-    async def move_domain(self, d: Domain, target: Link, reason: str, failback: bool = False) -> bool:
+    # ---------------------------------------------------------- domains
+    def route(self, iran_id: str, spec: str) -> Link | None:
+        return self.store.port_map(iran_id).get(first_port(spec))
+
+    def cover(self, d: Domain, iran_id: str, group: list[Link], stable: bool = False) -> tuple[list[str], list[str]]:
+        """Can this Iran server carry every port of the domain?
+        Returns (hard problems, soft problems): a hard problem is a reason to
+        move (missing, down, flapping, server gone); a soft one is a tunnel
+        that dropped a check or two."""
+        hard, soft = [], []
+        iran = self.store.servers.get(iran_id)
+        if iran is None or self.is_down(iran):
+            return [f"سرور داخل {self.name(iran_id)} در دسترس نیست"], []
+        allowed = {x.id for x in group} if d.group else None
+        for spec in self.store.domain_specs(d):
+            link = self.route(iran_id, spec)
+            if link is None:
+                hard.append(f"پورت {spec} روی {self.name(iran_id)} تانلی ندارد")
+                continue
+            owner = self.store.owner(iran_id, spec)
+            if allowed is not None and link.id not in allowed and (owner is None or owner.id not in allowed):
+                hard.append(f"پورت {spec} روی {self.name(iran_id)} با تانلی خارج از گروه دامنه است")
+                continue
+            ok = self.stable(link) if stable else self.healthy(link)
+            if not ok:
+                why = self.broken(link)
+                (hard if why or stable else soft).append(f"پورت {spec}: {why or 'تانل ' + self.link_label(link) + ' ناپایدار'}")
+        if not self.store.domain_specs(d):
+            hard.append("پورت‌های دامنه مشخص نشده")
+        return hard, soft
+
+    def routes_text(self, d: Domain, iran_id: str) -> str:
+        parts = []
+        for spec in self.store.domain_specs(d):
+            link = self.route(iran_id, spec)
+            parts.append(f"{spec}→{self.name(link.kharej_id) if link else '؟'}")
+        return "، ".join(parts)
+
+    async def move_domain(self, d: Domain, iran_id: str, reason: str, failback: bool = False) -> bool:
+        """Point the domain's A record at another Iran server."""
         st = self.store
-        home = st.links.get(d.link_id)
-        if home is not None and home.iran_id == target.iran_id:
-            if home.id == target.id:
-                return True
-            ok = await self.hand_over(home, target, f"دامنه {d.fqdn}: {reason}")
-            d.last_switch = time.time()
-            return ok
-        iran = st.servers.get(target.iran_id)
+        iran = st.servers.get(iran_id)
         p = st.providers.get(d.provider_id)
         if not iran or not p:
             await self.emit("error", "dns", f"دامنه {d.fqdn}: حساب DNS یا سرور مقصد پیدا نشد", domain=d.id)
             return False
+        if d.iran_id == iran_id and d.current_ip == iran.ip:
+            return True
         async with self._dns_lock:
             try:
                 await self.dns_factory(p).set_a(d.fqdn, iran.ip, d.ttl)
@@ -789,78 +823,133 @@ class Orchestrator:
                     d.error = str(e)
                     await self.emit("error", "dns", f"تغییر رکورد {d.fqdn} به {iran.ip} ناموفق بود: {e}", domain=d.id)
                 return False
-        old_iran = st.servers.get(home.iran_id) if home else None
-        d.link_id = target.id
+        old = st.servers.get(d.iran_id)
+        d.iran_id = iran_id
         d.current_ip, d.last_switch, d.error = iran.ip, time.time(), ""
         d.pending_ip, d.pending_since = iran.ip, time.time()
         d.status = "ok"
-        frm = f"{old_iran.name} ({old_iran.ip})" if old_iran else "—"
+        self.suggested.pop(d.id, None)
+        frm = f"{old.name} ({old.ip})" if old else "—"
+        routes = self.routes_text(d, iran_id)
         if failback:
-            msg = f"برگشت به سرور اصلی: رکورد {d.fqdn} از {frm} به {iran.name} ({iran.ip}) تغییر کرد — {reason}"
-        elif old_iran:
+            msg = f"برگشت به سرور اصلی: رکورد {d.fqdn} از {frm} به {iran.name} ({iran.ip}) تغییر کرد — {reason}. مسیرها: {routes}"
+        elif old:
             msg = (
                 f"رکورد {d.fqdn} از {frm} به {iran.name} ({iran.ip}) تغییر کرد — {reason}. "
-                f"تانل جدید: {self.link_label(target)}؛ در حال بررسی رسیدن تغییر به کاربران…"
+                f"مسیرها: {routes}؛ در حال بررسی رسیدن تغییر به کاربران…"
             )
         else:
-            msg = f"رکورد {d.fqdn} روی {iran.name} ({iran.ip}) تنظیم شد (تانل {self.link_label(target)})"
-        await self.emit("success" if failback or not old_iran else "warning", "dns", msg, domain=d.id)
+            msg = f"رکورد {d.fqdn} روی {iran.name} ({iran.ip}) تنظیم شد. مسیرها: {routes}"
+        await self.emit("success" if failback or not old else "warning", "dns", msg, domain=d.id)
         return True
 
     async def evaluate_domains(self) -> None:
         st = self.store
         for d in list(st.domains.values()):
+            if not d.iran_id:
+                await self._assign_initial(d)
+                continue
             group = st.group_of(d)
-            if not group:
-                d.status = "unknown"
-                continue
-            home = st.links.get(d.link_id)
-            if home is None:
-                await self._assign_initial(d, group)
-                continue
-            carrier = st.links.get(st.carrier(home.id)) or home
-            if self.healthy(carrier):
+            hard, soft = self.cover(d, d.iran_id, group)
+            if not hard and not soft:
                 if d.status != "ok":
                     d.status = "ok"
                     d.error = ""
                 if self.suggested.pop(d.id, None):
                     await self.emit("success", "observe", f"دامنه {d.fqdn} دوباره سالم است (حالت نظارت: تغییری داده نشده بود)", domain=d.id)
-                await self._maybe_failback(d, group, home)
+                await self._maybe_failback(d, group)
                 continue
-            why = self.broken(carrier)
-            if not why:
+            if not hard:
                 continue  # dropped a check or two: not a reason to move yet
+            why = "؛ ".join(hard[:3])
             if not d.auto_failover:
                 if d.status != "broken":
                     d.status = "broken"
                     await self.emit("error", "domain", f"دامنه {d.fqdn}: {why} (جابه‌جایی خودکار خاموش است)", domain=d.id)
                 continue
-            target = self._pick(group, home, carrier)
-            if target is None:
+            plan = self._plan(d, group)
+            if plan is None:
                 if any(x.id in self.busy for x in group):
                     continue  # a tunnel of the group is being built or repaired right now
                 if d.status != "broken":
                     d.status = "broken"
-                    await self.emit("error", "domain", f"دامنه {d.fqdn}: {why} و هیچ تانل سالمی در گروهش نیست؛ در حال ساخت/تعمیر تانل‌ها", domain=d.id)
+                    await self.emit(
+                        "error",
+                        "domain",
+                        f"دامنه {d.fqdn}: {why} — و هیچ سرور داخل دیگری همه پورت‌هایش ({', '.join(st.domain_specs(d))}) را سالم ندارد؛ رکورد تغییر نکرد",
+                        domain=d.id,
+                    )
                 self._kick(group)
                 continue
             if self.s.observe_only:
                 d.status = "broken"
-                await self._suggest(d, target, why)
+                await self._suggest(d, plan, why)
                 continue
-            await self.move_domain(d, target, why)
+            if plan[0] == "dns":
+                await self.move_domain(d, plan[1], why)
+            else:
+                _, owner, target, spec = plan
+                await self.hand_over(owner, target, f"دامنه {d.fqdn}، پورت {spec}: {why}")
+                d.last_switch = time.time()
 
-    async def _suggest(self, d: Domain, target: Link, why: str) -> None:
+    def _plan(self, d: Domain, group: list[Link]):
+        """What would fix the domain: ("handover", owner, target, spec) on the
+        same Iran server, or ("dns", iran_id) to another one, or None."""
+        st, cur = self.store, d.iran_id
+        broken_specs = []
+        for spec in st.domain_specs(d):
+            link = self.route(cur, spec)
+            if link is None or not self.healthy(link):
+                broken_specs.append(spec)
+        iran = st.servers.get(cur)
+        iran_dead = iran is None or self.is_down(iran)
+
+        def same_iran(spec):
+            """A spare tunnel on this Iran server to take the port over: one to
+            the same kharej (a spare on another transport), or to any other
+            kharej when this port's kharej is gone."""
+            if iran_dead:
+                return None
+            serving, owner = self.route(cur, spec), st.owner(cur, spec)
+            if serving is None or owner is None:
+                return None
+            kharej_dead = self.is_down(st.servers.get(serving.kharej_id))
+            for t in group:
+                if t.iran_id == cur and t.id != serving.id and self.healthy(t) and st.carrier(t.id) == t.id:
+                    if t.kharej_id == serving.kharej_id or kharej_dead:
+                        return ("handover", owner, t, spec)
+            return None
+
+        first = broken_specs[0] if broken_specs else None
+        if first is not None:
+            serving = self.route(cur, first)
+            if serving is not None and self.is_down(st.servers.get(serving.kharej_id)):
+                fix = same_iran(first)  # the kharej is gone, not the path: keep the Iran server
+                if fix:
+                    return fix
+        for t in group:
+            if t.status == L_PENDING:
+                continue
+            if t.iran_id == cur:
+                if first is not None:
+                    fix = same_iran(first)
+                    if fix and fix[2].id == t.id:
+                        return fix
+            elif not self.cover(d, t.iran_id, group)[0] and not self.cover(d, t.iran_id, group)[1]:
+                return ("dns", t.iran_id)
+        return None
+
+    async def _suggest(self, d: Domain, plan, why: str) -> None:
         """Observe mode: say what would have happened, once, and do nothing."""
-        if self.suggested.get(d.id) == target.id:
+        key = plan[1] if plan[0] == "dns" else f"{plan[1].id}>{plan[2].id}"
+        if self.suggested.get(d.id) == key:
             return
-        self.suggested[d.id] = target.id
-        home = self.store.links.get(d.link_id)
-        if home is not None and home.iran_id == target.iran_id:
-            would = f"پورت‌هایش روی همان سرور داخل به تانل {self.link_label(target)} منتقل می‌شد"
+        self.suggested[d.id] = key
+        if plan[0] == "dns":
+            iran = self.store.servers.get(plan[1])
+            would = f"رکوردش به {iran.name if iran else '?'} ({iran.ip if iran else '?'}) تغییر می‌کرد (مسیرها: {self.routes_text(d, plan[1])})"
         else:
-            iran = self.store.servers.get(target.iran_id)
-            would = f"رکوردش به {iran.name if iran else '?'} ({iran.ip if iran else '?'}) با تانل {self.link_label(target)} تغییر می‌کرد"
+            would = f"پورت {plan[3]} روی همان سرور داخل به تانل {self.link_label(plan[2])} منتقل می‌شد"
         await self.emit(
             "warning",
             "observe",
@@ -868,59 +957,80 @@ class Orchestrator:
             domain=d.id,
         )
 
-    def _pick(self, group: list[Link], home: Link, carrier: Link) -> Link | None:
+    async def _assign_initial(self, d: Domain) -> None:
+        """A domain without an Iran server yet: take the one its record
+        already points at, and the ports it serves there."""
         st = self.store
-        cands = [
-            c for c in group if c.id not in (home.id, carrier.id) and self.healthy(st.links.get(st.carrier(c.id)))
-        ]
-        if not cands:
-            return None
-        _, kharej = self.pair(home)
-        if self.is_down(kharej):
-            # the kharej is gone, not the path: keep the Iran server, change the kharej
-            same = [c for c in cands if c.iran_id == home.iran_id]
-            if same:
-                return same[0]
-        return cands[0]
-
-    async def _assign_initial(self, d: Domain, group: list[Link]) -> None:
-        """A domain without a tunnel yet: take the one its record already
-        points at if there is one, otherwise the best healthy one."""
-        st = self.store
-        if d.current_ip:
-            on_record = [x for x in group if getattr(st.servers.get(x.iran_id), "ip", None) == d.current_ip]
-            pick = next((x for x in on_record if self.healthy(x)), None) or (on_record[0] if on_record else None)
-            if pick:
-                d.link_id = pick.id
-                d.status = "ok" if self.healthy(pick) else "unknown"
-                await self.emit("info", "domain", f"دامنه {d.fqdn} الان به {self.name(pick.iran_id)} اشاره می‌کند؛ تانل {self.link_label(pick)} برایش انتخاب شد", notify=False, domain=d.id)
-                return
-        target = next((x for x in group if self.healthy(x)), None)
-        if target and d.auto_failover and not self.s.observe_only:
-            await self.move_domain(d, target, "تنظیم اولیه")
-        elif target and self.suggested.get(d.id) != f"init:{d.current_ip}":
+        match = next((s for s in st.irans() if d.current_ip and s.ip == d.current_ip), None)
+        if match:
+            d.iran_id = match.id
+            if not d.ports and d.kharej_id:
+                d.ports = st.domain_specs(d)
+            hard, _ = self.cover(d, d.iran_id, st.group_of(d))
+            d.status = "unknown" if hard else "ok"
+            tail = f"مسیرها: {self.routes_text(d, d.iran_id)}" if st.domain_specs(d) else "پورت‌های دامنه را در پنل دامنه مشخص کنید"
+            await self.emit("info", "domain", f"دامنه {d.fqdn} الان به {match.name} ({match.ip}) اشاره می‌کند؛ {tail}", notify=False, domain=d.id)
+            return
+        if not d.current_ip and not d.error:
+            return  # the record has not been read yet
+        if self.suggested.get(d.id) != f"init:{d.current_ip}":
             self.suggested[d.id] = f"init:{d.current_ip}"
             await self.emit(
                 "warning",
-                "observe",
-                f"دامنه {d.fqdn} به {d.current_ip or 'هیچ آی‌پی'} اشاره می‌کند که سرور داخلِ هیچ‌کدام از تانل‌های گروهش نیست؛ رکورد دست نخورد. گروه دامنه را بررسی کنید.",
+                "domain",
+                f"دامنه {d.fqdn} به {d.current_ip or 'هیچ آی‌پی'} اشاره می‌کند که هیچ‌کدام از سرورهای داخل ثبت‌شده نیست؛ رکورد دست نخورد. "
+                "در پنل دامنه سرور داخل را دستی انتخاب کنید.",
                 domain=d.id,
             )
 
-    async def _maybe_failback(self, d: Domain, group: list[Link], home: Link) -> None:
-        primary = group[0]
-        if not d.auto_failover or home.id == primary.id or primary.iran_id == home.iran_id:
-            return  # same-Iran handovers are released by release_handovers()
-        if not self.stable(primary) or time.time() - d.last_switch < self.s.failback_after:
+    async def _maybe_failback(self, d: Domain, group: list[Link]) -> None:
+        order = self.store.iran_order(d)
+        if not order or not d.auto_failover or self.s.observe_only:
             return
-        if self.s.observe_only:
+        primary = order[0]
+        if primary == d.iran_id or time.time() - d.last_switch < self.s.failback_after:
+            return
+        hard, soft = self.cover(d, primary, group, stable=True)
+        if hard or soft:
             return
         await self.move_domain(
             d,
             primary,
-            f"تانل اصلی {self.link_label(primary)} {fmt_dur(self.s.failback_after)} بدون قطعی پایدار بود",
+            f"همه پورت‌های {self.name(primary)} {fmt_dur(self.s.failback_after)} بدون قطعی پایدار بودند",
             failback=True,
         )
+
+    def domain_info(self, d: Domain) -> dict:
+        """Live view of a domain for the dashboard."""
+        st = self.store
+        group = st.group_of(d)
+        routes = []
+        for spec in st.domain_specs(d):
+            link = self.route(d.iran_id, spec) if d.iran_id else None
+            routes.append({
+                "spec": spec,
+                "link_id": link.id if link else "",
+                "kharej_id": link.kharej_id if link else "",
+                "healthy": self.healthy(link),
+            })
+        coverage = []
+        order = st.iran_order(d)
+        for s_ in st.irans():
+            hard, soft = self.cover(d, s_.id, group)
+            coverage.append({"iran_id": s_.id, "ok": not hard and not soft, "problems": hard + soft, "rank": order.index(s_.id) if s_.id in order else 99})
+        coverage.sort(key=lambda c: c["rank"])
+        failback = None
+        if order and order[0] != d.iran_id and d.auto_failover:
+            primary = order[0]
+            hard, soft = self.cover(d, primary, group)
+            if hard or soft:
+                failback = {"iran_id": primary, "wait": -1}
+            else:
+                since = max([d.last_switch] + [
+                    max(x.last_fail, x.up_since) for x in (self.route(primary, sp) for sp in st.domain_specs(d)) if x
+                ])
+                failback = {"iran_id": primary, "wait": max(0, round(self.s.failback_after - (time.time() - since)))}
+        return {"routes": routes, "coverage": coverage, "failback": failback}
 
     def _kick(self, group: list[Link]) -> None:
         if not self.s.auto_repair or self.s.observe_only:
@@ -954,11 +1064,10 @@ class Orchestrator:
                 continue
             seen = [a for a in answers.values() if a is not None]
             if seen and all(a == [d.pending_ip] for a in seen):
-                link = self.store.links.get(d.link_id)
                 await self.emit(
                     "success",
                     "propagated",
-                    f"بعد از {fmt_dur(waited)}، سرور {self.name(link.iran_id) if link else ''} ({d.pending_ip}) پشت دامنه {d.fqdn} قرار گرفت و ترافیک از تانل {self.link_label(link)} می‌گذرد",
+                    f"بعد از {fmt_dur(waited)}، سرور {self.name(d.iran_id)} ({d.pending_ip}) پشت دامنه {d.fqdn} قرار گرفت. مسیرها: {self.routes_text(d, d.iran_id)}",
                     domain=d.id,
                 )
                 d.pending_ip = ""
@@ -1001,9 +1110,9 @@ class Orchestrator:
         lines = ["<b>🌐 دامنه‌ها</b>"]
         for d in st.domains.values():
             dot = "🟢" if d.status == "ok" else "🔴" if d.status == "broken" else "⚪"
-            carrier = st.links.get(st.carrier(d.link_id)) if d.link_id else None
             extra = " ⏳ در حال انتشار DNS" if d.pending_ip else ""
-            lines.append(f"{dot} {esc(d.fqdn)} → {esc(self.link_label(carrier))}{extra}")
+            where = f"{self.name(d.iran_id)} ({self.routes_text(d, d.iran_id)})" if d.iran_id else "—"
+            lines.append(f"{dot} {esc(d.fqdn)} → {esc(where)}{extra}")
         return "\n".join(lines) if len(lines) > 1 else "دامنه‌ای ثبت نشده"
 
     def links_text(self) -> str:

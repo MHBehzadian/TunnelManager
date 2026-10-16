@@ -172,7 +172,7 @@ def test_v01_state_migrates(tmp_path):
     st = Store(tmp_path / "state.json")
     assert st.links["l"].ports == ["443"] and st.links["l"].accept_udp
     assert st.links["l"].status == "down"
-    assert st.domains["d"].link_id == "l"
+    assert st.domains["d"].iran_id == "i" and st.domains["d"].ports == ["443"]
     assert st.links["l"].iran_name == "tm-l"
 
 
