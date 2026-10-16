@@ -34,7 +34,7 @@ import socket
 import time
 from typing import Awaitable, Callable
 
-from .backpack import DeployError, Driver, Found, Probe, split_ports
+from .backpack import DeployError, Driver, Found, Probe, listen_ports, split_ports, unit_name
 from .dns import DNSClient
 from .dns.resolve import resolve_a
 from .models import (
@@ -93,6 +93,7 @@ class Orchestrator:
         self.last_probe: dict[str, Probe] = {}
         self.prev_ok: dict[str, bool] = {}
         self.flap_reported: set[str] = set()
+        self.suggested: dict[str, str] = {}  # observe mode: domain id -> what was proposed
         self.tasks: set[asyncio.Task] = set()
         self._check_lock = asyncio.Lock()
         self._dns_lock = asyncio.Lock()
@@ -193,14 +194,46 @@ class Orchestrator:
             return
         srv.backpack_version = await self.driver.ensure_installed(srv, self.s.install_backpack)
 
-    def _ensure_probe(self, link: Link) -> None:
-        if not link.probe_port:
-            link.probe_port = self.store.free_port(link.iran_id, self.s.probe_port_base)
+    async def _ensure_probe(self, link: Link) -> None:
+        if link.probe_port:
+            return
+        iran = self.store.servers.get(link.iran_id)
+        busy: set[int] = set()
+        if iran:
+            try:
+                busy = await self.driver.listening(iran)
+            except (SSHError, OSError):
+                pass
+        port = self.store.free_port(link.iran_id, self.s.probe_port_base)
+        while port in busy:
+            port += 1
+        link.probe_port = port
+
+    async def _ports_taken(self, link: Link) -> str:
+        """Before a tunnel is built for the first time: are any of the ports
+        it would listen on already used on the Iran server? A live server
+        must never have a port taken away from what is running there."""
+        if link.built:
+            return ""
+        iran = self.store.servers.get(link.iran_id)
+        if iran is None:
+            return ""
+        try:
+            busy = await self.driver.listening(iran)
+        except (SSHError, OSError) as e:
+            return f"پورت‌های آزاد {iran.name} بررسی نشد: {e}"
+        wanted = {link.tunnel_port} | listen_ports(self.store.link_ports(link))
+        if link.probe_port:
+            wanted.add(link.probe_port)
+        clash = sorted(wanted & busy)
+        if clash:
+            return f"پورت {', '.join(map(str, clash[:8]))} روی {iran.name} از قبل در حال استفاده است"
+        return ""
 
     async def _try(self, link: Link, transport: str, ports: list[str]) -> TestResult:
         iran, kharej = self.pair(link)
         assert iran and kharej
-        self._ensure_probe(link)
+        await self._ensure_probe(link)
         try:
             await self.driver.deploy(link, iran, kharej, transport, ports)
             p = await self.driver.wait_up(link, iran, self.s.test_timeout)
@@ -224,6 +257,7 @@ class Orchestrator:
         link.error = ""
         link.verified = True
         self.prev_ok[link.id] = True
+        link.built = True
         link.record(latency)
 
     async def discover(self, link: Link, transports: list[str] | None = None) -> bool:
@@ -243,6 +277,11 @@ class Orchestrator:
             except (SSHError, DeployError, OSError) as e:
                 link.status, link.error = L_DOWN, f"install: {e}"
                 await self.emit("error", "install", f"نصب BackPack روی {self.link_label(link)} ناموفق بود: {e}", link=link.id)
+                return False
+            taken = await self._ports_taken(link)
+            if taken:
+                link.status, link.error = (L_PENDING if not link.built else L_DOWN), taken
+                await self.emit("error", "discover", f"تانل {self.link_label(link)} ساخته نشد: {taken}", link=link.id)
                 return False
             cands = transports or link.allowed or self.s.candidate_transports
             await self.emit("info", "discover", f"تست پروتکل‌ها روی {self.link_label(link)}: {', '.join(cands)}", notify=False, link=link.id)
@@ -286,8 +325,9 @@ class Orchestrator:
         self.store.ensure_links()
         links = [x for x in self.store.links.values() if link_ids is None or x.id in link_ids]
         if link_ids is None:
-            # "build everything" builds what is not working; a running tunnel is left alone
-            links = [x for x in links if x.status != L_UP]
+            # "build everything" builds what is not built or clearly down; a
+            # working or merely wobbling tunnel is never touched
+            links = [x for x in links if x.status in (L_PENDING, L_DOWN) and x.id not in self.busy]
         await self.emit("info", "discover", f"شروع تست و اتصال {len(links)} تانل")
         sem = asyncio.Semaphore(parallel)
 
@@ -313,6 +353,11 @@ class Orchestrator:
         await self.changed()
         try:
             await asyncio.gather(self._install(iran), self._install(kharej))
+            taken = await self._ports_taken(link)
+            if taken:
+                link.status, link.error = (L_PENDING if not link.built else L_DOWN), taken
+                await self.emit("error", "transport", f"تانل {self.link_label(link)} ساخته نشد: {taken}", link=link.id)
+                return False
             r = await self._try(link, transport, self.store.link_ports(link))
             if r.ok:
                 self._mark_up(link, transport, r.latency_ms)
@@ -389,7 +434,7 @@ class Orchestrator:
         iran, kharej = self.pair(link)
         if not (self.usable(iran) and kharej and link.transport):
             return False
-        self._ensure_probe(link)
+        await self._ensure_probe(link)
         try:
             await self.driver.deploy_iran(link, iran, kharej, self.store.link_ports(link))  # type: ignore[arg-type]
             return True
@@ -439,6 +484,7 @@ class Orchestrator:
                 if f.role == "server" and port:
                     sides.setdefault((port, f.token), []).append((srv, f))
         added = 0
+        stale: list[str] = []
         loop = asyncio.get_running_loop()
         for sid, items in found.items():
             kharej = st.servers[sid]
@@ -468,8 +514,13 @@ class Orchestrator:
                 if match is None:
                     continue
                 iran, f = match
+                if f.active != "active" or c.active != "active":
+                    stale.append(f"{f.name} ({iran.name} ⇄ {kharej.name})")
+                    continue
                 if await self._adopt(iran, kharej, f, c):
                     added += 1
+        if stale:
+            log.info("scan: configs found but not running, left alone: %s", ", ".join(stale))
         if added:
             # drop the placeholders of pairs that turned out to have a tunnel already
             for link in list(st.links.values()):
@@ -498,6 +549,8 @@ class Orchestrator:
                 existing.probe_port = probe or existing.probe_port
                 existing.iran_base = {k: v for k, v in f.data.items() if k != "ports"}
                 existing.kharej_base = dict(c.data)
+                existing.iran_unit = "" if f.unit == unit_name(f.name) else f.unit
+                existing.kharej_unit = "" if c.unit == unit_name(c.name) else c.unit
             return False
         link = Link(
             iran_id=iran.id,
@@ -515,6 +568,9 @@ class Orchestrator:
             kharej_base=dict(c.data),
             label=f.name,
             status=L_DEGRADED,  # the next check decides
+            iran_unit="" if f.unit == unit_name(f.name) else f.unit,
+            kharej_unit="" if c.unit == unit_name(c.name) else c.unit,
+            built=True,
         )
         st.links[link.id] = link
         state = "فعال" if f.active == "active" and c.active == "active" else f"سرویس: {f.active or '?'} / {c.active or '?'}"
@@ -649,7 +705,7 @@ class Orchestrator:
 
     # -------------------------------------------------------------- policies
     def schedule_repairs(self) -> None:
-        if not self.s.auto_repair:
+        if not self.s.auto_repair or self.s.observe_only:
             return
         for link in self.store.links.values():
             if link.status != L_DOWN or link.id in self.busy:
@@ -692,6 +748,8 @@ class Orchestrator:
 
     async def release_handovers(self) -> None:
         st = self.store
+        if self.s.observe_only:
+            return
         for src_id, dst_id in list(st.handover.items()):
             src, dst = st.links.get(src_id), st.links.get(dst_id)
             if src is None or dst is None:
@@ -765,6 +823,8 @@ class Orchestrator:
                 if d.status != "ok":
                     d.status = "ok"
                     d.error = ""
+                if self.suggested.pop(d.id, None):
+                    await self.emit("success", "observe", f"دامنه {d.fqdn} دوباره سالم است (حالت نظارت: تغییری داده نشده بود)", domain=d.id)
                 await self._maybe_failback(d, group, home)
                 continue
             why = self.broken(carrier)
@@ -784,7 +844,29 @@ class Orchestrator:
                     await self.emit("error", "domain", f"دامنه {d.fqdn}: {why} و هیچ تانل سالمی در گروهش نیست؛ در حال ساخت/تعمیر تانل‌ها", domain=d.id)
                 self._kick(group)
                 continue
+            if self.s.observe_only:
+                d.status = "broken"
+                await self._suggest(d, target, why)
+                continue
             await self.move_domain(d, target, why)
+
+    async def _suggest(self, d: Domain, target: Link, why: str) -> None:
+        """Observe mode: say what would have happened, once, and do nothing."""
+        if self.suggested.get(d.id) == target.id:
+            return
+        self.suggested[d.id] = target.id
+        home = self.store.links.get(d.link_id)
+        if home is not None and home.iran_id == target.iran_id:
+            would = f"پورت‌هایش روی همان سرور داخل به تانل {self.link_label(target)} منتقل می‌شد"
+        else:
+            iran = self.store.servers.get(target.iran_id)
+            would = f"رکوردش به {iran.name if iran else '?'} ({iran.ip if iran else '?'}) با تانل {self.link_label(target)} تغییر می‌کرد"
+        await self.emit(
+            "warning",
+            "observe",
+            f"حالت نظارت — دامنه {d.fqdn}: {why}. اگر جابه‌جایی خودکار روشن بود، {would}. هیچ تغییری داده نشد.",
+            domain=d.id,
+        )
 
     def _pick(self, group: list[Link], home: Link, carrier: Link) -> Link | None:
         st = self.store
@@ -814,14 +896,24 @@ class Orchestrator:
                 await self.emit("info", "domain", f"دامنه {d.fqdn} الان به {self.name(pick.iran_id)} اشاره می‌کند؛ تانل {self.link_label(pick)} برایش انتخاب شد", notify=False, domain=d.id)
                 return
         target = next((x for x in group if self.healthy(x)), None)
-        if target and d.auto_failover:
+        if target and d.auto_failover and not self.s.observe_only:
             await self.move_domain(d, target, "تنظیم اولیه")
+        elif target and self.suggested.get(d.id) != f"init:{d.current_ip}":
+            self.suggested[d.id] = f"init:{d.current_ip}"
+            await self.emit(
+                "warning",
+                "observe",
+                f"دامنه {d.fqdn} به {d.current_ip or 'هیچ آی‌پی'} اشاره می‌کند که سرور داخلِ هیچ‌کدام از تانل‌های گروهش نیست؛ رکورد دست نخورد. گروه دامنه را بررسی کنید.",
+                domain=d.id,
+            )
 
     async def _maybe_failback(self, d: Domain, group: list[Link], home: Link) -> None:
         primary = group[0]
         if not d.auto_failover or home.id == primary.id or primary.iran_id == home.iran_id:
             return  # same-Iran handovers are released by release_handovers()
         if not self.stable(primary) or time.time() - d.last_switch < self.s.failback_after:
+            return
+        if self.s.observe_only:
             return
         await self.move_domain(
             d,
@@ -831,7 +923,7 @@ class Orchestrator:
         )
 
     def _kick(self, group: list[Link]) -> None:
-        if not self.s.auto_repair:
+        if not self.s.auto_repair or self.s.observe_only:
             return
         for link in group:
             if link.id in self.busy:

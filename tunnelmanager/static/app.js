@@ -208,7 +208,8 @@ function renderStats() {
     (flap ? `<span class="stat" style="color:var(--degraded)">${flap} تانل ناپایدار</span>` : "") +
     (prop ? `<span class="stat" style="color:var(--degraded)">${prop} در انتظار DNS</span>` : "") +
     (S.busy.length ? `<span class="stat" style="color:var(--testing)">${S.busy.length} عملیات در جریان</span>` : "") +
-    (S.demo ? `<span class="stat">حالت دمو</span>` : "");
+    (S.demo ? `<span class="stat">حالت دمو</span>` : "") +
+    (S.settings.observe_only ? `<span class="stat observe" id="observe-pill" title="پنل فقط نظارت و گزارش می‌کند؛ هیچ تغییری خودکار انجام نمی‌شود">● حالت نظارت</span>` : "");
 }
 setInterval(() => {
   if (!S) return;
@@ -956,6 +957,10 @@ function settingsForm() {
   const s = S.settings, tg = s.telegram;
   const order = [...s.candidate_transports, ...S.transports.filter((t) => !s.candidate_transports.includes(t))];
   openModal(`<h2>تنظیمات</h2>
+    <fieldset><legend>حالت کار</legend>
+      <label class="check"><input type="checkbox" name="observe_only" ${s.observe_only ? "checked" : ""}> <b>حالت نظارت</b>: فقط بررسی و گزارش؛ هیچ رکورد DNS، کانفیگ یا سرویسی خودکار تغییر نمی‌کند</label>
+      <p class="hint">در این حالت هر جا پنل می‌خواست کاری کند، فقط در رویدادها و تلگرام می‌گوید «اگر فعال بود چه می‌کرد». کارهایی که خودتان در پنل انجام دهید اجرا می‌شوند.</p>
+    </fieldset>
     <fieldset><legend>مانیتورینگ و جابه‌جایی</legend>
       <div class="grid2"><label>فاصله بررسی (ثانیه)<input name="check_interval" type="number" min="10" value="${s.check_interval}"></label>
       <label>چند خطای پشت‌سرهم = «قطع»<input name="fail_threshold" type="number" min="1" value="${s.fail_threshold}"></label></div>
@@ -991,7 +996,10 @@ function settingsForm() {
       <div class="btns"><button type="button" class="btn sm" data-add="provider">＋ حساب DNS</button></div>
     </fieldset>
     ${actions("ذخیره")}`, async (f) => {
+    const observe = !!f.get("observe_only");
+    if (S.settings.observe_only && !observe && !confirm("حالت نظارت خاموش شود؟ از این به بعد پنل در قطعی‌ها خودش رکورد DNS را عوض می‌کند" + (f.get("auto_repair") ? " و تانل‌های قطع را با پروتکل دیگر بازسازی می‌کند" : "") + ".")) return;
     await api("PUT", "/api/settings", {
+      observe_only: observe,
       check_interval: +f.get("check_interval"), fail_threshold: +f.get("fail_threshold"), test_timeout: +f.get("test_timeout"),
       failback_after: Math.round(+f.get("failback_after") * 60), flap_count: +f.get("flap_count"), flap_window: Math.round(+f.get("flap_window") * 60),
       auto_repair: !!f.get("auto_repair"), auto_adopt: !!f.get("auto_adopt"), auto_mesh: !!f.get("auto_mesh"),
@@ -1148,7 +1156,13 @@ document.addEventListener("mouseout", (e) => {
   if (from && from !== to) { focus = null; applyFocus(); tip.classList.remove("show"); }
 });
 
-$("#btn-discover").onclick = () => act(() => api("POST", "/api/discover", {}), "ساخت تانل‌های ساخته‌نشده و قطع شروع شد");
+$("#btn-discover").onclick = () => {
+  const n = S.links.filter((l) => l.status === "pending" || l.status === "down").length;
+  if (!n) return toast("تانل ساخته‌نشده یا قطعی وجود ندارد؛ به تانل‌های سالم دست زده نمی‌شود");
+  if (!confirm(`${n} تانل ساخته‌نشده یا قطع با تست همه پروتکل‌ها ساخته/بازسازی می‌شود. تانل‌های سالم دست نمی‌خورند. ادامه؟`)) return;
+  act(() => api("POST", "/api/discover", {}), "ساخت تانل‌ها شروع شد");
+};
+document.addEventListener("click", (e) => { if (e.target.closest("#observe-pill")) settingsForm(); });
 $("#btn-check").onclick = () => act(() => api("POST", "/api/check"), "بررسی فوری شروع شد");
 $("#btn-scan").onclick = async () => { const r = await act(() => api("POST", "/api/scan")); toast(r.added ? `${r.added} تانل موجود پیدا و اضافه شد` : "تانل جدیدی پیدا نشد", "success"); };
 $("#btn-add").onclick = (e) => { e.stopPropagation(); $("#add-pop").classList.toggle("open"); };

@@ -31,6 +31,7 @@ class SimNet(Driver):
         self.iran_ports: dict[str, list[str]] = {}  # link id -> ports on the Iran side
         self.stopped: set[str] = set()
         self.existing: dict[str, list[Found]] = {}
+        self.listen: dict[str, set[int]] = {}  # server id -> ports already in use
         self.calls: list[tuple] = []
         self.rnd = random.Random(1)
 
@@ -111,16 +112,21 @@ class SimNet(Driver):
             raise SSHError("down")
         return list(self.existing.get(s.id, []))
 
-    def plant(self, iran: Server, kharej: Server, name: str, transport: str, port: int, ports: list[str], token: str = "secret"):
+    async def listening(self, s):
+        return set(self.listen.get(s.id, set()))
+
+    def plant(self, iran: Server, kharej: Server, name: str, transport: str, port: int, ports: list[str],
+              token: str = "secret", active: str = "active", unit: str = ""):
         """Pretend a tunnel was set up by hand before the panel existed."""
+        unit = unit or f"backpack-{name}.service"
         self.existing.setdefault(iran.id, []).append(
-            Found(name=name, role="server", active="active", data={
+            Found(name=name, role="server", active=active, unit=unit, data={
                 "bind_addr": f"0.0.0.0:{port}", "transport": transport, "token": token, "ports": list(ports),
                 "mux_con": 8, "heartbeat": 40,
             })
         )
         self.existing.setdefault(kharej.id, []).append(
-            Found(name=name, role="client", active="active", data={
+            Found(name=name, role="client", active=active, unit=unit, data={
                 "remote_addr": f"{iran.ip}:{port}", "transport": transport, "token": token, "connection_pool": 8,
             })
         )
@@ -162,6 +168,8 @@ def seed(store: Store, net: SimNet) -> None:
         st.settings.failback_after = 120
         st.settings.flap_window = 180
         st.settings.scan_interval = 60
+        st.settings.observe_only = False  # the demo is there to watch failover happen
+        st.settings.auto_mesh = True
         for name, ip, prio in (("Hetzner-DE", "65.21.10.4", 1), ("OVH-FR", "51.75.33.9", 2), ("Contabo-NL", "185.2.4.77", 3)):
             s = Server(name=name, role=KHAREJ, ip=ip, priority=prio)
             st.servers[s.id] = s

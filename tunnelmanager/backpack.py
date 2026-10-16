@@ -86,6 +86,7 @@ class Found:
     role: str  # server | client
     data: dict[str, Any]
     active: str = ""
+    unit: str = ""  # systemd unit running it ("" = none found)
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -201,6 +202,14 @@ def unit_name(name: str) -> str:
     return f"backpack-{name}.service"
 
 
+def iran_unit(link: Link) -> str:
+    return link.iran_unit or unit_name(link.iran_name)
+
+
+def kharej_unit(link: Link) -> str:
+    return link.kharej_unit or unit_name(link.kharej_name)
+
+
 def conf_path(name: str) -> str:
     return f"{CONF_DIR}/{name}.toml"
 
@@ -235,12 +244,13 @@ def check_script(links: list[Link]) -> str:
     parts = []
     for x in links:
         n = shlex.quote(x.iran_name)
+        u = shlex.quote(iran_unit(x))
         if x.probe_port:
             probe = f't0=$(date +%s%N); b=$({_probe_snippet(x.probe_port)}); t1=$(date +%s%N); p=$( [ -n "$b" ] && echo 1 || echo 0)'
         else:
             probe = "t0=0; t1=0; p=-"
         parts.append(
-            f"""a=$(systemctl is-active backpack-{n}.service 2>/dev/null)
+            f"""a=$(systemctl is-active {u} 2>/dev/null)
 c=$(grep -o '"connected": *[a-z]*' {CONF_DIR}/{n}.metrics.json 2>/dev/null | grep -o '[a-z]*$')
 {probe}
 e=$(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '{{ split($2,a,":"); if (a[2]=="{x.tunnel_port:04X}" && $4=="01") n++ }} END {{ print n+0 }}')
@@ -316,12 +326,48 @@ def parse_wait(out: str) -> Probe:
 SCAN_SCRIPT = f"""for f in {CONF_DIR}/*.toml; do
   [ -f "$f" ] || continue
   n=$(basename "$f" .toml)
-  echo "@@FILE $n $(systemctl is-active backpack-$n.service 2>/dev/null)"
+  u="backpack-$n.service"
+  if ! systemctl cat "$u" >/dev/null 2>&1; then
+    u=$(grep -lsF -- "$f" /etc/systemd/system/*.service /lib/systemd/system/*.service /usr/lib/systemd/system/*.service 2>/dev/null | head -n1)
+    u=${{u##*/}}
+  fi
+  a=-
+  [ -n "$u" ] && a=$(systemctl is-active "$u" 2>/dev/null)
+  echo "@@FILE $n ${{u:--}} ${{a:--}}"
   head -c 65536 "$f"
   echo
 done
 echo "@@END"
 """
+
+LISTEN_SCRIPT = (
+    "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '$4==\"0A\" {split($2,a,\":\"); print a[2]}'; "
+    "cat /proc/net/udp /proc/net/udp6 2>/dev/null | awk '{split($2,a,\":\"); print a[2]}'"
+)
+
+
+def parse_listening(out: str) -> set[int]:
+    ports = set()
+    for w in out.split():
+        try:
+            ports.add(int(w, 16))
+        except ValueError:
+            pass
+    return ports
+
+
+def listen_ports(mappings: list[str], limit: int = 5000) -> set[int]:
+    """The ports a list of mappings makes the Iran side listen on."""
+    out: set[int] = set()
+    for m in mappings:
+        port = m.split("=", 1)[0].strip().rsplit(":", 1)[-1]
+        lo, _, hi = port.partition("-")
+        try:
+            a, b = int(lo), int(hi or lo)
+        except ValueError:
+            continue
+        out.update(range(a, min(b, a + limit) + 1))
+    return out
 
 
 def parse_scan(out: str) -> list[Found]:
@@ -332,9 +378,16 @@ def parse_scan(out: str) -> list[Found]:
     for chunk in chunks:
         head, _, body = chunk.partition("\n")
         body = body.split("@@END")[0]
-        name, _, active = head.strip().partition(" ")
-        if not _NAME.match(name):
+        parts = head.split()
+        if not parts or not _NAME.match(parts[0]):
             continue
+        name = parts[0]
+        if len(parts) >= 3:  # name unit active
+            unit, active = parts[1], parts[2]
+        else:  # older panel scripts: name active
+            unit, active = unit_name(name), (parts[1] if len(parts) > 1 else "")
+        unit = "" if unit == "-" else unit
+        active = "" if active == "-" else active
         try:
             data = tomllib.loads(body)
         except tomllib.TOMLDecodeError:
@@ -343,7 +396,7 @@ def parse_scan(out: str) -> list[Found]:
         for role in ("server", "client"):
             sec = data.get(role)
             if isinstance(sec, dict) and sec.get("transport") != "spoof":
-                found.append(Found(name=name, role=role, data=sec, active=active.strip()))
+                found.append(Found(name=name, role=role, data=sec, active=active.strip(), unit=unit))
     return found
 
 
@@ -379,6 +432,9 @@ class Driver:
     async def check(self, iran: Server, links: list[Link]) -> dict[str, Probe]: ...
     async def wait_up(self, link: Link, iran: Server, timeout: int) -> Probe: ...
     async def scan(self, s: Server) -> list[Found]: ...
+
+    async def listening(self, s: Server) -> set[int]:
+        return set()
 
 
 class SSHDriver(Driver):
@@ -444,14 +500,21 @@ class SSHDriver(Driver):
         return ver
 
     # ---- deploy --------------------------------------------------------
-    async def _install_side(self, s: Server, name: str, toml: str, open_ports: list[str]) -> None:
-        if not _NAME.match(name):
+    async def _install_side(self, s: Server, name: str, toml: str, open_ports: list[str], unit: str = "") -> None:
+        if not _NAME.match(name) or (unit and not _NAME.match(unit)):
             raise DeployError(f"bad tunnel name {name!r}")
-        await self.pool.run(s, f"mkdir -p {CONF_DIR} && chmod 700 {CONF_DIR}")
-        await self.pool.put(s, toml.encode(), conf_path(name), 0o600)
-        u = unit_name(name)
-        # keep an existing unit (adopted tunnels may have their own); write ours otherwise
-        r = await self.pool.run(s, f"test -f {UNIT_DIR}/{u} && echo yes || echo no", timeout=15)
+        conf = conf_path(name)
+        # the first time the panel touches a config it did not write, keep the
+        # original next to it: <name>.toml.tm-orig (never overwritten)
+        await self.pool.run(
+            s,
+            f"mkdir -p {CONF_DIR} && chmod 700 {CONF_DIR}; "
+            f"if [ -f {conf} ] && [ ! -f {conf}.tm-orig ]; then cp -p {conf} {conf}.tm-orig; fi; true",
+        )
+        await self.pool.put(s, toml.encode(), conf, 0o600)
+        u = unit or unit_name(name)
+        # keep an existing unit (adopted tunnels have their own); write ours otherwise
+        r = await self.pool.run(s, f"systemctl cat {u} >/dev/null 2>&1 && echo yes || echo no", timeout=15)
         if r.out.strip() != "yes":
             await self.pool.put(s, render_unit(name).encode(), f"{UNIT_DIR}/{u}", 0o644)
         cmd = (
@@ -466,8 +529,8 @@ class SSHDriver(Driver):
     async def deploy(self, link: Link, iran: Server, kharej: Server, transport: str, ports: list[str]) -> None:
         open_ports = [str(link.tunnel_port)] + ports
         await asyncio.gather(
-            self._install_side(iran, link.iran_name, render_server(link, transport, ports, kharej), open_ports),
-            self._install_side(kharej, link.kharej_name, render_client(link, transport, iran), []),
+            self._install_side(iran, link.iran_name, render_server(link, transport, ports, kharej), open_ports, iran_unit(link)),
+            self._install_side(kharej, link.kharej_name, render_client(link, transport, iran), [], kharej_unit(link)),
         )
 
     async def deploy_iran(self, link: Link, iran: Server, kharej: Server, ports: list[str]) -> None:
@@ -476,12 +539,13 @@ class SSHDriver(Driver):
             link.iran_name,
             render_server(link, link.transport, ports, kharej),
             [str(link.tunnel_port)] + ports,
+            iran_unit(link),
         )
 
-    async def _stop_side(self, s: Server | None, name: str, purge: bool) -> None:
-        if s is None or not _NAME.match(name):
+    async def _stop_side(self, s: Server | None, name: str, purge: bool, unit: str = "") -> None:
+        if s is None or not _NAME.match(name) or (unit and not _NAME.match(unit)):
             return
-        u = unit_name(name)
+        u = unit or unit_name(name)
         cmd = f"systemctl disable --now {u} >/dev/null 2>&1; true"
         if purge:
             cmd += f"; rm -f {UNIT_DIR}/{u} {conf_path(name)} {CONF_DIR}/{name}.metrics.json; systemctl daemon-reload"
@@ -492,12 +556,14 @@ class SSHDriver(Driver):
 
     async def stop(self, link: Link, iran: Server | None, kharej: Server | None) -> None:
         await asyncio.gather(
-            self._stop_side(iran, link.iran_name, False), self._stop_side(kharej, link.kharej_name, False)
+            self._stop_side(iran, link.iran_name, False, iran_unit(link)),
+            self._stop_side(kharej, link.kharej_name, False, kharej_unit(link)),
         )
 
     async def remove(self, link: Link, iran: Server | None, kharej: Server | None) -> None:
         await asyncio.gather(
-            self._stop_side(iran, link.iran_name, True), self._stop_side(kharej, link.kharej_name, True)
+            self._stop_side(iran, link.iran_name, True, iran_unit(link)),
+            self._stop_side(kharej, link.kharej_name, True, kharej_unit(link)),
         )
 
     # ---- health / discovery -------------------------------------------
@@ -514,3 +580,7 @@ class SSHDriver(Driver):
     async def scan(self, s: Server) -> list[Found]:
         r = await self.pool.run(s, SCAN_SCRIPT, timeout=30)
         return parse_scan(r.out)
+
+    async def listening(self, s: Server) -> set[int]:
+        r = await self.pool.run(s, LISTEN_SCRIPT, timeout=20)
+        return parse_listening(r.out)

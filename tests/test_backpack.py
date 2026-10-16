@@ -138,6 +138,7 @@ def test_parsers():
 
 def test_store_ports_and_handover_dedupe():
     st = Store(None)
+    st.settings.auto_mesh = True
     k1 = Server(name="K1", role=KHAREJ, ip="10.0.0.1")
     k2 = Server(name="K2", role=KHAREJ, ip="10.0.0.2")
     i = Server(name="I", role=IRAN, ip="10.0.0.3")

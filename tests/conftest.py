@@ -19,6 +19,8 @@ class World:
         self.store = Store(None)
         st = self.store
         st.settings.fail_threshold = 2
+        st.settings.observe_only = False
+        st.settings.auto_mesh = True
         st.settings.candidate_transports = ["tcpmux", "wsmux", "tcp", "quic"]
         self.k1 = Server(name="K1", role=KHAREJ, ip="10.0.1.1", priority=1)
         self.k2 = Server(name="K2", role=KHAREJ, ip="10.0.1.2", priority=2)

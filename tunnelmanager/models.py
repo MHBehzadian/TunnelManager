@@ -122,6 +122,10 @@ class Link(Model):
     kharej_base: dict[str, Any] = field(default_factory=dict)  # original [client] keys
     allowed: list[str] = field(default_factory=list)  # transports repair may use; [] = global list
     pinned: bool = False  # never change the transport automatically
+    # systemd units running each side; "" = BackPack's own "backpack-<name>.service"
+    iran_unit: str = ""
+    kharej_unit: str = ""
+    built: bool = False  # has run at least once (adopted tunnels: always)
     # runtime
     status: str = L_PENDING
     latency_ms: float | None = None
@@ -215,6 +219,11 @@ class Telegram(Model):
 
 @dataclass
 class Settings(Model):
+    # Observe only: watch, show and report, but change nothing by itself (no
+    # DNS switch, no config rewrite, no restart). Actions taken by hand in
+    # the panel still work. On by default, so a fresh panel pointed at live
+    # servers cannot disturb them until it is switched off on purpose.
+    observe_only: bool = True
     check_interval: int = 30
     fail_threshold: int = 3  # consecutive failed checks before a tunnel counts as down
     flap_window: int = 600  # seconds
@@ -226,7 +235,7 @@ class Settings(Model):
     test_timeout: int = 15  # seconds a transport gets to come up during a test
     auto_repair: bool = True  # rebuild broken tunnels with other transports
     auto_adopt: bool = True  # import tunnels already running on the servers
-    auto_mesh: bool = True  # offer a (not yet built) tunnel for pairs that have none
+    auto_mesh: bool = False  # offer a (not yet built) tunnel for pairs that have none
     scan_interval: int = 600
     install_backpack: bool = True  # push the binary to servers that lack it
     backpack_release: str = "latest"  # GitHub release tag, or "latest"

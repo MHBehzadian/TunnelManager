@@ -108,6 +108,7 @@ input[type="checkbox"] { width: 16px; height: 16px; min-height: 0; accent-color:
 .stat { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--line); font-size: 12.5px; color: var(--muted); }
 .stat b { font-family: var(--mono); font-weight: 600; color: var(--text); }
 .stat .d { width: 7px; height: 7px; border-radius: 50%; }
+.stat.observe { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); cursor: pointer; }
 .actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .live { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; margin-inline-end: 4px; }
 .live i { width: 7px; height: 7px; border-radius: 50%; background: var(--down); }

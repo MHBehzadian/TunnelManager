@@ -21,6 +21,8 @@ def test_setup_login_and_crud(tmp_path):
         assert c.post("/api/setup", json={"username": "admin", "password": "secret1"}).status_code == 200
         assert c.post("/api/setup", json={"username": "x", "password": "secret2"}).status_code == 409
         assert c.get("/api/state").status_code == 200
+        assert c.get("/api/settings").json()["observe_only"] is True  # safe by default
+        assert c.put("/api/settings", json={"auto_mesh": True}).status_code == 200
 
         k = c.post("/api/servers", json={"name": "K", "role": "kharej", "ip": "10.0.0.1", "ssh_password": "pw"}).json()
         assert k["server"]["ssh_password"] == "••••"

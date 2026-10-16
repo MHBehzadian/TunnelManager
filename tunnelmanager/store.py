@@ -68,6 +68,8 @@ class Store:
                         link.ports = list(s["ports"])
                         link.accept_udp = bool(s.get("accept_udp"))
         for link in self.links.values():
+            if link.transport and link.status != L_PENDING:
+                link.built = True
             if link.status == "suspended":
                 link.status = L_PENDING if not link.transport else "down"
         # v0.1 domains pointed at an Iran server rather than a tunnel
