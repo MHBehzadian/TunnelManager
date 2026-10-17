@@ -79,3 +79,14 @@ def test_setup_login_and_crud(tmp_path):
         c.post("/api/login", json={"username": "admin", "password": "secret1"})
         st = c.get("/api/state").json()
         assert len(st["servers"]) == 2 and st["links"][0]["ports"] == ["443", "8443=2096"]
+
+
+def test_password_changed_from_cli_works_without_restart(tmp_path):
+    from tunnelmanager.auth import Auth
+
+    with client(tmp_path) as c:
+        assert c.post("/api/setup", json={"username": "admin", "password": "first1"}).status_code == 200
+        c.cookies.clear()
+        Auth(tmp_path / "auth.json").set_password("admin", "second2")  # what `passwd` does
+        assert c.post("/api/login", json={"username": "admin", "password": "first1"}).status_code == 401
+        assert c.post("/api/login", json={"username": "admin", "password": "second2"}).status_code == 200
