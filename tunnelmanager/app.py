@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import ipaddress
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import __version__
+from . import backup as bk
 from .auth import COOKIE, SESSION_TTL, Auth
 from .backpack import Driver, SSHDriver, validate_port_mapping
 from .dns import KINDS, client_for
@@ -166,6 +169,14 @@ class LoginIn(BaseModel):
     password: str
 
 
+class RestoreIn(BaseModel):
+    name: str = ""  # a copy kept on this server...
+    data: str = ""  # ...or an uploaded file, base64
+    password: str = ""
+    observe: bool = True  # come back in observe mode: nothing acts on a restored state unchecked
+    restore_login: bool = True
+
+
 class SetupIn(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=6)
@@ -216,13 +227,59 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
             return client_for(p, proxy=os.environ.get("TM_DNS_PROXY") or None)
 
     orch = Orchestrator(store, driver, dns_factory, notify=bot.notify, broadcast=hub.send, resolver=resolver)
-    bot.handler = orch.bot_command
+    backups = bk.Backups(data)
     monitor_enabled = os.environ.get("TM_NO_MONITOR") != "1"
+
+    async def make_backup(kind: str) -> dict[str, Any]:
+        """Build a backup, keep a copy here and send it to Telegram."""
+        pw = store.settings.backup_password
+        data_ = bk.make(store.raw(), dict(auth.data), backups.env())
+        blob = await asyncio.to_thread(bk.pack, data_, pw)
+        path = backups.write(blob, bool(pw), "" if kind == "nightly" else kind)
+        backups.prune(store.settings.backup_keep)
+        store.meta["last_backup"] = time.time()
+        title = {"nightly": "بکاپ شبانه", "manual": "بکاپ دستی", "pre": "بکاپ پیش از بازگردانی"}.get(kind, "بکاپ")
+        caption = (
+            f"🗄 <b>{title} TunnelManager</b>\n{bk.summary(data_)}\n"
+            + ("🔒 رمزدار" if pw else "⚠️ بدون رمز: شامل رمزهای SSH و توکن‌هاست. در تنظیمات برایش رمز بگذارید.")
+        )
+        result = {"name": path.name, "size": len(blob), "encrypted": bool(pw), "sent": 0, "error": ""}
+        if kind != "pre":
+            try:
+                result["sent"] = await bot.send_file(path.name, blob, caption)
+            except Exception as e:
+                result["error"] = str(e)
+                await orch.emit("error", "backup", f"{title} ساخته شد ({path.name}) ولی به تلگرام نرسید: {e}")
+            else:
+                await orch.emit("success", "backup", f"{title} ساخته و به تلگرام فرستاده شد ({path.name})", notify=False)
+        await orch.changed()
+        return result
+
+    async def backup_loop() -> None:
+        while True:
+            await asyncio.sleep(30)
+            s_ = store.settings
+            if s_.backup_enabled and bk.due(time.time(), s_.backup_time, s_.backup_tz, store.meta.get("last_backup", 0)):
+                try:
+                    await make_backup("nightly")
+                except Exception:
+                    log.exception("nightly backup failed")
+                    store.meta["last_backup"] = time.time()  # try again tomorrow, not every 30 s
+
+    async def bot_command(cmd: str, args: list[str]) -> str:
+        if cmd == "/backup":
+            r = await make_backup("manual")
+            return "🗄 بکاپ فرستاده شد." if r["sent"] else f"بکاپ ساخته شد ولی ارسال نشد: {r['error']}"
+        return await orch.bot_command(cmd, args)
+
+    bot.handler = bot_command
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         bot.start()
         tasks = [asyncio.create_task(orch.run())] if monitor_enabled else []
+        if monitor_enabled and not demo:
+            tasks.append(asyncio.create_task(backup_loop()))
         if demo:
             from .demo import chaos
 
@@ -295,6 +352,7 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         settings = store.settings.to_dict()
         tg = store.settings.tg()
         settings["telegram"] = {**tg.to_dict(), "bot_token": MASK if tg.bot_token else ""}
+        settings["backup_password"] = MASK if store.settings.backup_password else ""
         for dd in st["domains"]:
             d = store.domains.get(dd["id"])
             if d:
@@ -648,6 +706,18 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         new.flap_window = max(60, int(new.flap_window))
         new.flap_count = max(2, int(new.flap_count))
         new.scan_interval = max(60, int(new.scan_interval))
+        new.backup_password = keep_secret(body.get("backup_password"), store.settings.backup_password)
+        new.backup_keep = min(100, max(1, int(new.backup_keep)))
+        if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", str(new.backup_time).strip()):
+            raise HTTPException(400, "ساعت بکاپ باید به شکل 03:00 باشد")
+        new.backup_time = str(new.backup_time).strip().zfill(5)
+        try:
+            from zoneinfo import ZoneInfo
+
+            ZoneInfo(new.backup_tz)
+        except Exception:
+            if new.backup_tz != "Asia/Tehran":
+                raise HTTPException(400, f"منطقه زمانی نامعتبر: {new.backup_tz}") from None
         if tg_in is not None:
             old = store.settings.tg()
             tg = Telegram.from_dict({**old.to_dict(), **tg_in})
@@ -667,6 +737,64 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         except Exception as e:
             raise HTTPException(502, str(e))
         return {"ok": True}
+
+    # ---- backups -----------------------------------------------------
+    @app.get("/api/backups", dependencies=A)
+    async def list_backups():
+        return {"files": backups.list(), "last": store.meta.get("last_backup", 0), "encrypted": bool(store.settings.backup_password)}
+
+    @app.post("/api/backups/run", dependencies=A)
+    async def run_backup():
+        return await make_backup("manual")
+
+    @app.get("/api/backups/download", dependencies=A)
+    async def download_backup(name: str = ""):
+        try:
+            if name:
+                blob = backups.read(name)
+            else:
+                pw = store.settings.backup_password
+                blob = await asyncio.to_thread(bk.pack, bk.make(store.raw(), dict(auth.data), backups.env()), pw)
+                name = f"tm-backup-{time.strftime('%Y%m%d-%H%M')}.{'tmbk' if pw else 'json.gz'}"
+        except bk.BackupError as e:
+            raise HTTPException(404, str(e)) from None
+        return Response(blob, media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+    @app.post("/api/backups/restore", dependencies=A)
+    async def restore_backup(body: RestoreIn):
+        try:
+            if body.name:
+                blob = backups.read(body.name)
+            else:
+                if len(body.data) > 70_000_000:
+                    raise bk.BackupError("فایل خیلی بزرگ است")
+                blob = base64.b64decode(body.data, validate=False)
+            data_ = await asyncio.to_thread(bk.unpack, blob, body.password or store.settings.backup_password)
+        except bk.BackupError as e:
+            raise HTTPException(400, str(e)) from None
+        except ValueError:
+            raise HTTPException(400, "فایل خوانده نشد") from None
+        if orch.busy:
+            raise HTTPException(409, "عملیاتی روی تانل‌ها در جریان است؛ چند لحظه بعد دوباره امتحان کنید")
+        async with orch._check_lock:
+            await make_backup("pre")  # the state being replaced, in case this was a mistake
+            store.apply(data_["state"])
+            if body.observe:
+                store.settings.observe_only = True
+            relogin = False
+            if body.restore_login and data_.get("auth", {}).get("hash"):
+                relogin = data_["auth"] != auth.data
+                auth.data = dict(data_["auth"])
+                auth._save()
+            orch.reset()
+            store.save()
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(data_.get("created", 0)))
+        await orch.emit(
+            "warning",
+            "backup",
+            f"بکاپ {when} بازگردانی شد ({bk.summary(data_)})" + ("؛ پنل در حالت نظارت است" if store.settings.observe_only else ""),
+        )
+        return {"ok": True, "summary": bk.summary(data_), "created": data_.get("created", 0), "relogin": relogin}
 
     # ---- static UI -----------------------------------------------------
     app.mount("/static", StaticFiles(directory=STATIC), name="static")

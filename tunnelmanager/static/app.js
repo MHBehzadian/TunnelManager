@@ -1073,6 +1073,15 @@ function settingsForm() {
       <label>پروکسی<input name="tg_proxy" class="mono" value="${esc(tg.proxy)}" placeholder="socks5://127.0.0.1:1080"></label></div>
       <div class="btns"><button type="button" class="btn sm" id="tg-test">ارسال پیام تست</button></div>
     </fieldset>
+    <fieldset><legend>بکاپ</legend>
+      <label class="check"><input type="checkbox" name="backup_enabled" ${s.backup_enabled ? "checked" : ""}> هر شب بکاپ کامل به تلگرام فرستاده شود</label>
+      <div class="grid2"><label>ساعت<input name="backup_time" class="mono" value="${esc(s.backup_time)}" placeholder="03:00"></label>
+      <label>منطقه زمانی<input name="backup_tz" class="mono" value="${esc(s.backup_tz)}" placeholder="Asia/Tehran"></label></div>
+      <div class="grid2"><label>رمز بکاپ<input name="backup_password" type="password" class="mono" autocomplete="new-password" value="${esc(s.backup_password)}" placeholder="خالی = بدون رمز"></label>
+      <label>تعداد نسخه روی همین سرور<input name="backup_keep" type="number" min="1" max="100" value="${s.backup_keep}"></label></div>
+      <p class="hint">بکاپ شامل همه سرورها، رمزهای SSH، توکن‌ها، دامنه‌ها، تنظیمات و ورود پنل است؛ حتماً رمز بگذارید و رمز را جای دیگری نگه دارید. بدون آن رمز، بکاپ باز نمی‌شود.</p>
+      <div class="btns"><button type="button" class="btn sm" id="bk-now">ارسال بکاپ همین حالا</button><a class="btn sm" href="/api/backups/download" download>دانلود بکاپ</a><button type="button" class="btn sm" id="bk-restore">بازگردانی بکاپ…</button></div>
+    </fieldset>
     <fieldset><legend>حساب‌های DNS</legend>
       <div class="opt-list">${S.providers.map((p) => `<div class="opt"><span class="prov ${p.kind}">${p.kind === "cloudflare" ? "CF" : "ARVAN"}</span><span class="grow">${esc(p.name)} <span class="mono muted small">${esc(p.zone)}</span></span>
         <button type="button" class="btn sm" data-verify-provider="${p.id}">تست</button><button type="button" class="btn sm" data-edit-provider="${p.id}">ویرایش</button><button type="button" class="btn sm danger" data-del-provider="${p.id}">حذف</button></div>`).join("") || "<span class='muted small'>—</span>"}</div>
@@ -1089,14 +1098,51 @@ function settingsForm() {
       scan_interval: Math.round(+f.get("scan_interval") * 60), candidate_transports: f.getAll("tr"),
       tunnel_port_base: +f.get("tunnel_port_base"), probe_port_base: +f.get("probe_port_base"),
       backpack_release: f.get("backpack_release").trim() || "latest", install_backpack: !!f.get("install_backpack"),
+      backup_enabled: !!f.get("backup_enabled"), backup_time: f.get("backup_time").trim(), backup_tz: f.get("backup_tz").trim() || "Asia/Tehran",
+      backup_password: f.get("backup_password"), backup_keep: +f.get("backup_keep") || 14,
       telegram: { enabled: !!f.get("tg_enabled"), bot_token: f.get("tg_token"), chat_ids: lines(f.get("tg_chats")), api_base: f.get("tg_base").trim() || "https://api.telegram.org", proxy: f.get("tg_proxy").trim() },
     });
     toast("تنظیمات ذخیره شد", "success");
   });
+  $("#bk-now").onclick = () => act(async () => {
+    const r = await api("POST", "/api/backups/run");
+    if (r.error) throw new Error(`بکاپ ساخته شد ولی به تلگرام نرسید: ${r.error}`);
+  }, "بکاپ به تلگرام فرستاده شد");
+  $("#bk-restore").onclick = restoreForm;
   $("#tg-test").onclick = async () => {
     $("#modal-form").requestSubmit();
     setTimeout(() => act(() => api("POST", "/api/telegram/test"), "پیام تست ارسال شد"), 600);
   };
+}
+
+async function restoreForm() {
+  const info = await api("GET", "/api/backups");
+  const size = (n) => (n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.ceil(n / 1024)} KB`);
+  const rows = info.files.map((f, i) => `<label class="opt"><input type="radio" name="bk_name" value="${esc(f.name)}">
+    <span class="grow"><span class="mono">${esc(f.name)}</span><span class="sub">${clock(f.mtime)} · ${size(f.size)} ${f.encrypted ? "· 🔒" : ""}</span></span>
+    <a class="btn sm ghost" href="/api/backups/download?name=${encodeURIComponent(f.name)}" download>دانلود</a></label>`).join("");
+  openModal(`<h2>بازگردانی بکاپ</h2>
+    <p class="note">همه سرورها، تانل‌ها، دامنه‌ها، حساب‌های DNS و تنظیمات پنل با محتوای بکاپ جایگزین می‌شود. روی خود سرورها و رکوردهای DNS <b>هیچ تغییری</b> داده نمی‌شود؛ پنل بعد از بازگردانی همه‌چیز را دوباره بررسی می‌کند. وضعیت فعلی هم قبلش یک بکاپ جدا می‌گیرد.</p>
+    <label>فایل بکاپ (از تلگرام یا دانلود)<input type="file" name="bk_file" accept=".tmbk,.gz,.json"></label>
+    ${rows ? `<label>یا یکی از نسخه‌های روی همین سرور</label><div class="opt-list">${rows}</div>` : ""}
+    <label>رمز بکاپ<input name="bk_pw" type="password" class="mono" autocomplete="off" placeholder="${info.encrypted ? "خالی = رمز فعلی تنظیمات" : ""}"></label>
+    <label class="check"><input type="checkbox" name="bk_observe" checked> بعد از بازگردانی در حالت نظارت بماند (پیشنهادی)</label>
+    <label class="check"><input type="checkbox" name="bk_login" checked> نام کاربری و رمز ورود پنل هم از بکاپ برگردد</label>
+    ${actions("بازگردانی")}`, async (f) => {
+    const file = f.get("bk_file");
+    const body = { password: f.get("bk_pw"), observe: !!f.get("bk_observe"), restore_login: !!f.get("bk_login") };
+    if (file && file.size) {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < buf.length; i += 32768) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 32768));
+      body.data = btoa(bin);
+    } else if (f.get("bk_name")) body.name = f.get("bk_name");
+    else throw new Error("یک فایل یا یکی از نسخه‌ها را انتخاب کنید");
+    if (!confirm("وضعیت فعلی پنل با این بکاپ جایگزین شود؟")) return;
+    const r = await api("POST", "/api/backups/restore", body);
+    toast(`بازگردانی شد: ${r.summary}`, "success");
+    if (r.relogin) setTimeout(() => location.reload(), 1200);
+  });
 }
 
 /* --------------------------------------------------------------- clicks */

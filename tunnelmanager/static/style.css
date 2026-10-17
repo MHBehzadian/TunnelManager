@@ -59,8 +59,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 a { color: var(--accent); }
 
 /* ---------- controls ---------- */
-.btn {
-  height: 34px; padding: 0 13px; border-radius: 9px; border: 1px solid var(--line2); background: var(--surface);
+.btn, a.btn {
+  height: 34px; padding: 0 13px; border-radius: 9px; border: 1px solid var(--line2); background: var(--surface); text-decoration: none;
   color: var(--text); cursor: pointer; white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   transition: background .12s, border-color .12s;
 }

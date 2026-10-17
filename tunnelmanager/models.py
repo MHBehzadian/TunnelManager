@@ -258,6 +258,12 @@ class Settings(Model):
         default_factory=lambda: ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"]
     )
     telegram: dict[str, Any] = field(default_factory=lambda: Telegram().to_dict())
+    # full backup every night, sent to the Telegram chats and kept locally
+    backup_enabled: bool = True
+    backup_time: str = "03:00"
+    backup_tz: str = "Asia/Tehran"
+    backup_password: str = ""  # encrypts the file; it holds SSH passwords and API tokens
+    backup_keep: int = 14  # local copies
 
     def tg(self) -> Telegram:
         return Telegram.from_dict(self.telegram)

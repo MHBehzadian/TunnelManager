@@ -42,13 +42,17 @@ class Store:
         self.handover: dict[str, str] = {}
         # dashboard canvas: node id -> [x, y]
         self.layout: dict[str, list[float]] = {}
+        self.meta: dict[str, Any] = {}  # bookkeeping, e.g. when the last backup ran
         if self.path and self.path.exists():
             self.load()
 
     # ---- persistence -------------------------------------------------
     def load(self) -> None:
         assert self.path
-        raw = json.loads(self.path.read_text())
+        self.apply(json.loads(self.path.read_text()))
+
+    def apply(self, raw: dict) -> None:
+        """Replace everything with a saved state (a state file or a backup)."""
         self.servers = {d["id"]: Server.from_dict(d) for d in raw.get("servers", [])}
         self.links = {d["id"]: Link.from_dict(d) for d in raw.get("links", [])}
         self.domains = {d["id"]: Domain.from_dict(d) for d in raw.get("domains", [])}
@@ -57,6 +61,7 @@ class Store:
         self.events = [Event.from_dict(d) for d in raw.get("events", [])]
         self.handover = dict(raw.get("handover", {}))
         self.layout = dict(raw.get("layout", {}))
+        self.meta = dict(raw.get("meta", {}))
         self._migrate(raw)
 
     def _migrate(self, raw: dict) -> None:
@@ -92,10 +97,8 @@ class Store:
                 if link:
                     d.ports = list(link.ports)
 
-    def save(self) -> None:
-        if not self.path:
-            return
-        data = {
+    def raw(self) -> dict[str, Any]:
+        return {
             "servers": [s.to_dict() for s in self.servers.values()],
             "links": [x.to_dict() for x in self.links.values()],
             "domains": [d.to_dict() for d in self.domains.values()],
@@ -104,7 +107,13 @@ class Store:
             "events": [e.to_dict() for e in self.events[-MAX_EVENTS:]],
             "handover": self.handover,
             "layout": self.layout,
+            "meta": self.meta,
         }
+
+    def save(self) -> None:
+        if not self.path:
+            return
+        data = self.raw()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".state-")
         with os.fdopen(fd, "w") as f:

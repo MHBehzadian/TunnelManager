@@ -103,6 +103,18 @@ class Orchestrator:
         self.last_scan: float = 0
         self.last_exits: float = 0
 
+    def reset(self) -> None:
+        """Forget everything learnt at run time (after the state is replaced
+        by a backup): the next check starts from what the servers say."""
+        self.repair_after.clear()
+        self.last_probe.clear()
+        self.prev_ok.clear()
+        self.flap_reported.clear()
+        self.suggested.clear()
+        self.last_read.clear()
+        self.last_scan = self.last_exits = 0
+        self.wake()
+
     # ------------------------------------------------------------------ util
     @property
     def s(self):
@@ -1237,7 +1249,7 @@ class Orchestrator:
         if cmd in ("/start", "/help"):
             return (
                 "دستورها:\n/status — خلاصه وضعیت\n/links — وضعیت تانل‌ها\n"
-                "/domains — دامنه‌ها و مسیرشان\n/check — بررسی فوری همه مسیرها\n/scan — جستجوی تانل‌های موجود روی سرورها"
+                "/domains — دامنه‌ها و مسیرشان\n/check — بررسی فوری همه مسیرها\n/scan — جستجوی تانل‌های موجود روی سرورها\n/backup — بکاپ کامل همین حالا"
             )
         if cmd == "/status":
             return self.summary()

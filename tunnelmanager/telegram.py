@@ -72,6 +72,34 @@ class TelegramBot:
             "sendMessage", cfg, chat_id=chat_id, text=text[:4000], parse_mode="HTML", disable_web_page_preview=True
         )
 
+    async def send_file(self, name: str, blob: bytes, caption: str = "", cfg: Telegram | None = None) -> int:
+        """Send a file to every chat; returns how many got it."""
+        cfg = cfg or self.get_cfg()
+        if not cfg.bot_token or not cfg.chat_ids:
+            raise RuntimeError("ربات تلگرام یا Chat ID تنظیم نشده")
+        sent, last = 0, None
+        for chat in cfg.chat_ids:
+            for attempt in range(3):
+                try:
+                    r = await self._http(cfg).post(
+                        self._url(cfg, "sendDocument"),
+                        data={"chat_id": chat, "caption": caption[:1000], "parse_mode": "HTML"},
+                        files={"document": (name, blob, "application/octet-stream")},
+                        timeout=120,
+                    )
+                    body = r.json()
+                    if not body.get("ok"):
+                        raise RuntimeError(body.get("description", f"HTTP {r.status_code}"))
+                    sent += 1
+                    break
+                except Exception as e:
+                    last = e
+                    log.warning("telegram file to %s failed: %s", chat, e)
+                    await asyncio.sleep(3 * (attempt + 1))
+        if not sent and last:
+            raise RuntimeError(str(last))
+        return sent
+
     async def _sender(self) -> None:
         while True:
             text = await self.queue.get()
