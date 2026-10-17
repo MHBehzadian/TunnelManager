@@ -73,6 +73,9 @@ class Store:
                 link.built = True
             if link.status == "suspended":
                 link.status = L_PENDING if not link.transport else "down"
+        for d in self.domains.values():
+            if d.iran_id and not d.primary_iran:
+                d.primary_iran = d.iran_id
         # v0.2 domains followed one tunnel: take its Iran server and ports
         for d in self.domains.values():
             link = self.links.get(d.link_id)
@@ -274,8 +277,11 @@ class Store:
         return g[0] if g else None
 
     def iran_order(self, d: Domain) -> list[str]:
-        """Iran servers in the order the domain's group prefers them."""
+        """Iran servers in the order the domain prefers them: its primary
+        first, then the backups in the group's order (server priority)."""
         out: list[str] = []
+        if d.primary_iran in self.servers and not d.group:
+            out.append(d.primary_iran)
         for x in self.group_of(d):
             if x.status != L_PENDING and x.iran_id not in out:
                 out.append(x.iran_id)

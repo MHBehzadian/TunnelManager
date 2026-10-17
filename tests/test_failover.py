@@ -285,3 +285,25 @@ async def test_missing_port_gets_its_tunnel_built_then_domain_moves(world):
     # the panel built I2-K2 first, and only then moved: both ports work on I2
     assert w.link(w.i2, w.k2).status == L_UP
     assert w.dom.iran_id == w.i2.id
+
+
+async def test_primary_is_where_the_record_pointed_not_the_priority(world):
+    """Equal priorities sort by name: that must never pull a domain away from
+    the Iran server it already uses."""
+    w = world
+    w.i1.priority = w.i2.priority = 100
+    w.i1.name, w.i2.name = "B-tehran", "A-shiraz"  # A sorts first
+    await connected(w)
+    assert w.dom.iran_id == w.i1.id and w.dom.primary_iran == w.i1.id
+    w.age(3600)
+    await w.settle(2)
+    assert w.dom.iran_id == w.i1.id and FakeDNS.calls == []
+    # an outage still fails over to the backup, and failback returns to the primary
+    w.net.dead.add(w.i1.id)
+    await w.settle(3)
+    assert w.dom.iran_id == w.i2.id
+    w.net.dead.discard(w.i1.id)
+    await w.settle(2)
+    w.age(601)
+    await w.settle(1)
+    assert w.dom.iran_id == w.i1.id

@@ -964,6 +964,7 @@ class Orchestrator:
         match = next((s for s in st.irans() if d.current_ip and s.ip == d.current_ip), None)
         if match:
             d.iran_id = match.id
+            d.primary_iran = d.primary_iran or match.id
             if not d.ports and d.kharej_id:
                 d.ports = st.domain_specs(d)
             hard, _ = self.cover(d, d.iran_id, st.group_of(d))

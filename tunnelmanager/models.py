@@ -201,6 +201,9 @@ class Domain(Model):
     # different tunnel to a different kharej; the domain is healthy only
     # when every one of them is.
     iran_id: str = ""
+    # where traffic returns once it is stable again: the Iran server the
+    # record pointed at when the domain was added, or one chosen by hand
+    primary_iran: str = ""
     ports: list[str] = field(default_factory=list)  # "443", "2053-2060"; [] = the ports of kharej_id's tunnels
     link_id: str = ""  # v0.2: the single tunnel a domain used (kept for migration)
     ttl: int = 120

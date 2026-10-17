@@ -828,7 +828,7 @@ function domainDrawer() {
     const sub = c.ok ? "همه پورت‌ها سالم" : (c.problems[0] || "");
     return `<div class="opt ${c.ok ? "" : "off"}"><span class="dot ${c.ok ? "up" : "down"}"></span>
       <span class="grow"><span>${esc(s.name)} <span class="mono muted small">${esc(s.ip)}</span></span><span class="sub">${esc(sub)}${c.problems.length > 1 ? ` (+${c.problems.length - 1})` : ""}</span></span>
-      ${tags.join("")}${c.ok && c.iran_id !== d.iran_id ? `<button class="btn sm" data-switch="${c.iran_id}">انتقال</button>` : ""}</div>`;
+      ${tags.join("")}${c.iran_id !== d.primary_iran ? `<button class="btn sm ghost" data-primary="${c.iran_id}" title="بعد از رفع قطعی، ترافیک به این سرور برمی‌گردد">اصلی شود</button>` : ""}${c.ok && c.iran_id !== d.iran_id ? `<button class="btn sm" data-switch="${c.iran_id}">انتقال</button>` : ""}</div>`;
   }).join("");
   // 4. allowed tunnels (advanced)
   const manual = groupDraft ? groupDraft.manual : d.group.length > 0;
@@ -902,8 +902,9 @@ function serverForm(role, s) {
     <label>کلید خصوصی SSH (اختیاری)<textarea name="ssh_key" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----">${edit && s.ssh_key ? "••••" : ""}</textarea></label>
     ${k ? `<label>هدف پروب سلامت<input name="probe_target" class="mono" value="${esc(s.probe_target)}" placeholder="127.0.0.1:${s.ssh_port}"></label>
     <p class="hint">پنل برای تست واقعی مسیر، از داخل تانل به این آدرس روی سرور خارج وصل می‌شود (پیش‌فرض: SSH همین سرور).</p>` : ""}
-    <div class="grid2"><label>اولویت (کمتر = ترجیح)<input name="priority" type="number" value="${s.priority}"></label>
+    <div class="grid2"><label>اولویت (عدد کمتر = اول)<input name="priority" type="number" value="${s.priority}"></label>
     <label class="check" style="align-self:end"><input type="checkbox" name="enabled" ${s.enabled ? "checked" : ""}> فعال</label></div>
+    <p class="hint">${k ? "وقتی یک سرور خارج کامل از کار بیفتد، پورت‌هایش به خارجی با عدد کمتر منتقل می‌شود." : "در قطعی، دامنه به سرور داخلی با عدد کمتر منتقل می‌شود."} اگر همه برابر باشند ترتیب الفبایی نام است. سرور «اصلی» هر دامنه جداست و با اولویت عوض نمی‌شود.</p>
     ${edit ? "" : `<p class="hint">بعد از اتصال، پنل خودش تانل‌های BackPack که از قبل روی سرورها فعال‌اند را پیدا و اضافه می‌کند.</p>`}
     ${actions(edit ? "ذخیره" : "افزودن")}`, async (f) => {
     const body = {
@@ -1051,7 +1052,7 @@ function saveDomain(dom, patch) {
   });
 }
 
-const CLICKABLE = "[data-add],[data-close],[data-close-modal],[data-link],[data-pick],[data-apply-transport],[data-retest],[data-unpin],[data-edit-server],[data-test-server],[data-install],[data-del-server],[data-scan],[data-new-link],[data-release],[data-save-ports],[data-save-link],[data-del-link],[data-discover-links],[data-switch],[data-save-dports],[data-sync],[data-edit-domain],[data-del-domain],[data-verify-provider],[data-edit-provider],[data-del-provider],[data-g-mode],[data-g-toggle],[data-g-up],[data-g-down],[data-g-save],[data-g-cancel]";
+const CLICKABLE = "[data-add],[data-close],[data-close-modal],[data-link],[data-pick],[data-apply-transport],[data-retest],[data-unpin],[data-edit-server],[data-test-server],[data-install],[data-del-server],[data-scan],[data-new-link],[data-release],[data-save-ports],[data-save-link],[data-del-link],[data-discover-links],[data-switch],[data-primary],[data-save-dports],[data-sync],[data-edit-domain],[data-del-domain],[data-verify-provider],[data-edit-provider],[data-del-provider],[data-g-mode],[data-g-toggle],[data-g-up],[data-g-down],[data-g-save],[data-g-cancel]";
 document.addEventListener("click", async (e) => {
   const t = e.target.closest(CLICKABLE);
   if (!t) {
@@ -1104,8 +1105,13 @@ document.addEventListener("click", async (e) => {
   if (d.switch) {
     const dom = S.domains.find((x) => x.id === drawer.id);
     const s = srv(d.switch);
-    if (!confirm(`رکورد ${dom.fqdn} در DNS به ${s.name} (${s.ip}) تغییر کند؟`)) return;
+    const note = s.id !== dom.primary_iran && dom.auto_failover && !S.settings.observe_only ? `\n\nسرور اصلی این دامنه ${nm(dom.primary_iran)} است؛ اگر این تغییر باید دائمی باشد، ${s.name} را «اصلی» کنید، وگرنه بعد از پایداری اصلی، ترافیک به آن برمی‌گردد.` : "";
+    if (!confirm(`رکورد ${dom.fqdn} در DNS به ${s.name} (${s.ip}) تغییر کند؟${note}`)) return;
     return act(() => api("POST", `/api/domains/${dom.id}/switch`, { iran_id: d.switch }), "رکورد تغییر کرد");
+  }
+  if (d.primary) {
+    const dom = S.domains.find((x) => x.id === drawer.id);
+    return act(() => api("POST", `/api/domains/${dom.id}/primary`, { iran_id: d.primary }), `${nm(d.primary)} سرور اصلی ${dom.fqdn} شد`);
   }
   if (d.saveDports) {
     const dom = S.domains.find((x) => x.id === d.saveDports);

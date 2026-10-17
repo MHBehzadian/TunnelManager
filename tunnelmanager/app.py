@@ -624,6 +624,16 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         orch.wake()
         return {"ok": True}
 
+    @app.post("/api/domains/{did}/primary", dependencies=A)
+    async def set_primary(did: str, body: SwitchIn):
+        d = get(store.domains, did)
+        iran = get(store.servers, body.iran_id)
+        if iran.role != IRAN:
+            raise HTTPException(400, "not an Iran server")
+        d.primary_iran = iran.id
+        await orch.emit("info", "domain", f"سرور اصلی دامنه {d.fqdn}: {iran.name}", notify=False, domain=d.id)
+        return {"ok": True}
+
     @app.post("/api/domains/{did}/sync", dependencies=A)
     async def sync(did: str):
         d = get(store.domains, did)
