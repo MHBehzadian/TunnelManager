@@ -34,7 +34,7 @@ import socket
 import time
 from typing import Awaitable, Callable
 
-from .backpack import DeployError, Driver, Found, Probe, listen_ports, split_ports, unit_name
+from .backpack import DeployError, Driver, Found, Probe, listen_ports, split_ports, target_host, unit_name
 from .dns import DNSClient
 from .dns.resolve import resolve_a
 from .models import (
@@ -101,6 +101,7 @@ class Orchestrator:
         self._wake = asyncio.Event()
         self.last_check: float = 0
         self.last_scan: float = 0
+        self.last_exits: float = 0
 
     # ------------------------------------------------------------------ util
     @property
@@ -697,12 +698,88 @@ class Orchestrator:
             if self.s.auto_adopt and time.time() - self.last_scan >= self.s.scan_interval:
                 await self.scan_all()
             await self.check_links()
+            await self.check_exits()
             await self.evaluate_domains()
             await self.release_handovers()
             self.schedule_repairs()
             await self.check_propagation()
             self.last_check = time.time()
             await self.changed()
+
+    # ----------------------------------------------------------------- exits
+    async def check_exits(self) -> None:
+        """Where forwarded ports go after the kharej, and whether that exit
+        answers. Shown and reported only: no decision depends on it."""
+        if time.time() - self.last_exits < max(60, self.s.check_interval):
+            return
+        self.last_exits = time.time()
+        st = self.store
+
+        async def one(k: Server):
+            ports, remote = st.kharej_ports(k.id)
+            if not ports and not remote:
+                k.exits, k.exit_reach = {}, {}
+                return
+            known = sorted({t for h in k.exits.values() for t in h["targets"]} | set(remote))
+            try:
+                found, reach = await self.driver.exits(k, ports, known)
+            except (SSHError, OSError) as e:
+                log.info("exits %s: %s", k.name, e)
+                return
+            await self._update_exits(k, ports, found, reach)
+
+        try:
+            await asyncio.gather(*(one(k) for k in st.kharejs() if self.usable(k)))
+        except Exception:  # only a view: it must never stop the monitor
+            log.exception("exit check failed")
+
+    def _exit_name(self, t: str) -> str:
+        host = target_host(t)
+        srv = next((s for s in self.store.servers.values() if s.ip == host), None)
+        return f"{srv.name} ({t})" if srv else t
+
+    async def _update_exits(self, k: Server, ports: list[int], found: dict[int, dict], reach: dict[str, bool]) -> None:
+        now_ = time.time()
+        new: dict[str, dict] = {}
+        for port in ports:
+            key = str(port)
+            hop, old = found.get(port), k.exits.get(key)
+            if hop:
+                new[key] = {**hop, "seen": now_}
+            elif old and old.get("inferred") and now_ - old.get("seen", 0) < 3600:
+                new[key] = old  # inferred from live connections: keep it through a quiet spell
+            hop = new.get(key)
+            if (set(hop["targets"]) if hop else None) != (set(old["targets"]) if old else None):
+                if hop:
+                    to = "، ".join(self._exit_name(t) for t in hop["targets"])
+                    msg = f"پورت {port} روی {k.name} به {to} فوروارد می‌شود ({hop['method']}{'، از روی اتصال‌ها' if hop.get('inferred') else ''})"
+                else:
+                    msg = f"پورت {port} روی {k.name} دیگر به سرور دیگری فوروارد نمی‌شود"
+                await self.emit("info", "exit", msg, notify=False, server=k.id)
+        k.exits = new
+        used = {t for h in new.values() for t in h["targets"]} | set(self.store.kharej_ports(k.id)[1])
+        k.exit_reach = {t: r for t, r in k.exit_reach.items() if t in used}
+        for t, ok in reach.items():
+            if t not in used:
+                continue
+            r = k.exit_reach.get(t) or {"ok": None, "fails": 0, "since": now_}
+            ports_ = [p for p, h in new.items() if t in h["targets"]] or ["-"]
+            if ok:
+                if r["ok"] is False:
+                    await self.emit("success", "exit", f"خروجی {self._exit_name(t)} از {k.name} دوباره در دسترس است (پورت {', '.join(ports_)})", server=k.id)
+                r = {"ok": True, "fails": 0, "since": r["since"] if r["ok"] else now_}
+            else:
+                r = {**r, "fails": r["fails"] + 1}
+                if r["fails"] >= self.s.fail_threshold and r["ok"] is not False:
+                    r.update(ok=False, since=now_)
+                    await self.emit(
+                        "warning",
+                        "exit",
+                        f"پورت {', '.join(ports_)} از {k.name} به {self._exit_name(t)} فوروارد می‌شود ولی این مقصد از {k.name} جواب نمی‌دهد. "
+                        "(فقط اطلاع؛ این مرحله بیرون از تانل است و پنل چیزی را عوض نمی‌کند)",
+                        server=k.id,
+                    )
+            k.exit_reach[t] = r
 
     # -------------------------------------------------------------- policies
     def schedule_repairs(self) -> None:
@@ -803,7 +880,9 @@ class Orchestrator:
         parts = []
         for spec in self.store.domain_specs(d):
             link = self.route(iran_id, spec)
-            parts.append(f"{spec}→{self.name(link.kharej_id) if link else '؟'}")
+            e = self.store.exit_of(link, first_port(spec))
+            tail = "↪" + "/".join(self.name(t["server_id"]) if t["server_id"] else t["addr"] for t in e["targets"]) if e else ""
+            parts.append(f"{spec}→{self.name(link.kharej_id) if link else '؟'}{tail}")
         return "، ".join(parts)
 
     async def move_domain(self, d: Domain, iran_id: str, reason: str, failback: bool = False) -> bool:
@@ -1039,6 +1118,7 @@ class Orchestrator:
                 "link_id": link.id if link else "",
                 "kharej_id": link.kharej_id if link else "",
                 "healthy": self.healthy(link),
+                "exit": st.exit_of(link, first_port(spec)),
             })
         coverage = []
         order = st.iran_order(d)

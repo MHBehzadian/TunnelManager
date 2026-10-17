@@ -32,6 +32,8 @@ class SimNet(Driver):
         self.stopped: set[str] = set()
         self.existing: dict[str, list[Found]] = {}
         self.listen: dict[str, set[int]] = {}  # server id -> ports already in use
+        self.fwd: dict[str, dict[int, dict]] = {}  # kharej id -> port -> where it is sent on
+        self.ip_of: dict[str, str] = {}  # ip -> server id, so exits to a dead server fail
         self.calls: list[tuple] = []
         self.rnd = random.Random(1)
 
@@ -114,6 +116,13 @@ class SimNet(Driver):
 
     async def listening(self, s):
         return set(self.listen.get(s.id, set()))
+
+    async def exits(self, s, ports, targets):
+        if s.id in self.dead:
+            raise SSHError(f"{s.name} unreachable")
+        found = {p: dict(h) for p, h in self.fwd.get(s.id, {}).items() if p in ports}
+        reach = {t: self.ip_of.get(t.rsplit(":", 1)[0], "") not in self.dead for t in targets}
+        return found, reach
 
     def plant(self, iran: Server, kharej: Server, name: str, transport: str, port: int, ports: list[str],
               token: str = "secret", active: str = "active", unit: str = ""):
@@ -202,6 +211,10 @@ def seed(store: Store, net: SimNet) -> None:
         net.plant(ir[1], kh[2], "contabo-shz", "kcp", 3081, ["2087"])
         net.plant(ir[1], kh[1], "ovh-shz", "tcpmux", 3082, ["2053", "2083"])
         net.plant(ir[2], kh[2], "contabo-mhd", "wsmux", 3081, ["2087"])
+        # some ports leave from another server than the tunnel's kharej
+        net.ip_of = {s.ip: s.id for s in st.servers.values()}
+        net.fwd[kh[0].id] = {443: {"method": "iptables", "targets": [f"{kh[2].ip}:443"], "via": "", "inferred": False}}
+        net.fwd[kh[1].id] = {2083: {"method": "gost", "targets": ["203.0.113.50:2083"], "via": "gost", "inferred": False}}
 
 
 async def chaos(orch, net: SimNet) -> None:

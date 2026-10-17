@@ -185,6 +185,9 @@ main > * { min-width: 0; }
 .hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
 .dim { opacity: .07 !important; }
 .wire.hl { stroke-width: 3.4; opacity: 1; }
+.xwire { fill: none; stroke: var(--handover); stroke-width: 1.6; stroke-dasharray: 7 3 1.5 3; opacity: .8; }
+.xwire.down { stroke: var(--down); opacity: 1; }
+.wlabel.hop { pointer-events: none; } .wlabel.hop text { fill: var(--handover); } .wlabel.hop.down text { fill: var(--down); }
 @keyframes dash { to { stroke-dashoffset: -18; } }
 .wlabel { pointer-events: all; cursor: pointer; }
 .wlabel rect { fill: var(--surface); stroke: var(--line2); }
@@ -197,6 +200,7 @@ main > * { min-width: 0; }
 .legend { position: absolute; top: 10px; inset-inline-start: 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11.5px; color: var(--muted); background: color-mix(in srgb, var(--surface) 85%, transparent); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; max-width: calc(100% - 24px); backdrop-filter: blur(6px); }
 .legend span { display: inline-flex; align-items: center; gap: 5px; }
 .sw { width: 16px; height: 2.5px; border-radius: 2px; display: inline-block; }
+.sw.exit { background: repeating-linear-gradient(90deg, var(--handover) 0 5px, transparent 5px 8px); }
 .sw.up { background: var(--up); } .sw.degraded { background: var(--degraded); }
 .sw.down { background: repeating-linear-gradient(90deg, var(--down) 0 4px, transparent 4px 7px); }
 .sw.testing { background: var(--testing); } .sw.handover { background: var(--handover); }

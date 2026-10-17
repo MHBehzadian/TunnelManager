@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .backpack import listen_ports
+from .backpack import RANGE_TO, kharej_dest, listen_ports, target_host
 from .models import (
     IRAN,
     KHAREJ,
@@ -287,6 +287,57 @@ class Store:
                 out.append(x.iran_id)
         return out
 
+    # ---- exits: where a port finally leaves from --------------------------
+    def kharej_ports(self, kharej_id: str, limit: int = 200) -> tuple[list[int], list[str]]:
+        """Ports the kharej's tunnels deliver to on the kharej itself, and the
+        ones BackPack sends straight on to another host ("443=1.2.3.4:5201")."""
+        local: list[int] = []
+        remote: list[str] = []
+        for x in self.links.values():
+            if x.kharej_id != kharej_id or x.status == L_PENDING:
+                continue
+            for m in x.ports:
+                dest = kharej_dest(m)
+                if not dest:
+                    continue
+                host, port = dest
+                if host:
+                    t = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+                    if t not in remote:
+                        remote.append(t)
+                elif "=" not in m and not RANGE_TO.match(m) and "-" in m:
+                    local += sorted(listen_ports([m], limit=20))  # a plain range: the same ports
+                else:
+                    local.append(port)
+        return sorted(set(local))[:limit], remote
+
+    def exit_of(self, link: Link | None, port: int) -> dict[str, Any] | None:
+        """Where traffic for this Iran-side port leaves from after the tunnel:
+        None = from the kharej itself."""
+        if link is None:
+            return None
+        mapping = next((m for m in self.link_ports(link) if port in listen_ports([m])), None)
+        dest = kharej_dest(mapping) if mapping else None
+        k = self.servers.get(link.kharej_id)
+        if not dest or not k:
+            return None
+        host, kport = dest
+        if not host and "=" not in mapping and not RANGE_TO.match(mapping):
+            kport = port  # "2053-2060": each port goes to the same port
+        if host:
+            t = f"[{host}]:{kport}" if ":" in host else f"{host}:{kport}"
+            hop = {"method": "backpack", "targets": [t], "via": "", "inferred": False}
+        else:
+            hop = k.exits.get(str(kport))
+        if not hop:
+            return None
+        by_ip = {s.ip: s.id for s in self.servers.values()}
+        targets = []
+        for t in hop["targets"]:
+            r = k.exit_reach.get(t) or {}
+            targets.append({"addr": t, "server_id": by_ip.get(target_host(t), ""), "ok": r.get("ok")})
+        return {"from": k.id, "port": kport, "method": hop["method"], "inferred": hop.get("inferred", False), "targets": targets}
+
     def snapshot(self) -> dict[str, Any]:
         """What the dashboard renders. Secrets are masked."""
         links = []
@@ -297,6 +348,12 @@ class Store:
             d["token"] = ""
             d["exposed"] = self.link_ports(x)
             d["carrier"] = self.carrier(x.id)
+            d["exits"] = {}
+            for m in d["exposed"]:
+                port = first_port(m)
+                e = self.exit_of(x, port)
+                if e:
+                    d["exits"][m] = e
             links.append(d)
         domains = []
         for d in self.domains.values():

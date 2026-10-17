@@ -65,6 +65,8 @@ ARCH = {
 _SAFE = re.compile(r"^[A-Za-z0-9_.:\-=|,\[\]]+$")
 _NAME = re.compile(r"^[A-Za-z0-9_.\-]+$")
 PROBE_RE = re.compile(r"^127\.0\.0\.1:(\d+)=127\.0\.0\.1:\d+$")
+RANGE_TO = re.compile(r"^(\d+-\d+):(\d+)$")  # "443-600:5201": a range sent to one port
+_TARGET = re.compile(r"^[A-Za-z0-9.\-]+:\d{1,5}$|^\[[0-9A-Fa-f:.]+\]:\d{1,5}$")
 
 
 class DeployError(Exception):
@@ -364,7 +366,9 @@ def listen_ports(mappings: list[str], limit: int = 5000) -> set[int]:
     """The ports a list of mappings makes the Iran side listen on."""
     out: set[int] = set()
     for m in mappings:
-        port = m.split("=", 1)[0].strip().rsplit(":", 1)[-1]
+        left = m.split("=", 1)[0].strip()
+        rng = RANGE_TO.match(left)
+        port = rng.group(1) if rng else left.rsplit(":", 1)[-1]
         lo, _, hi = port.partition("-")
         try:
             a, b = int(lo), int(hi or lo)
@@ -372,6 +376,195 @@ def listen_ports(mappings: list[str], limit: int = 5000) -> set[int]:
             continue
         out.update(range(a, min(b, a + limit) + 1))
     return out
+
+
+# ---------------------------------------------------------------- exits
+# What happens to a forwarded port after BackPack delivers it on the kharej:
+# served right there, or sent on to another server (iptables/nft DNAT, socat,
+# gost, realm, haproxy, xray...) so traffic leaves from a different IP. The
+# panel only looks; nothing here changes anything on the server.
+LOCAL_HOSTS = {"", "localhost", "0.0.0.0", "::", "::1"}
+
+
+def is_local(host: str) -> bool:
+    host = host.strip("[]")
+    return host in LOCAL_HOSTS or host.startswith(("127.", "::ffff:127."))
+
+
+def target_host(t: str) -> str:
+    """"1.2.3.4:443" -> "1.2.3.4", "[::1]:443" -> "::1", "1.2.3.4" -> itself."""
+    if t.startswith("["):
+        return t[1:].split("]", 1)[0]
+    return t.rsplit(":", 1)[0] if t.count(":") == 1 else t
+
+
+def kharej_dest(mapping: str) -> tuple[str, int] | None:
+    """Where the kharej side delivers a forwarded port: (host, port), host ""
+    for the kharej itself. "443" -> ("", 443), "8443=2096" -> ("", 2096),
+    "443=1.2.3.4:5201" -> ("1.2.3.4", 5201), "443-600:5201" -> ("", 5201)."""
+    m = mapping.strip()
+    host = ""
+    if "=" in m:
+        right = m.split("=", 1)[1].strip()
+        host, _, port = right.rpartition(":")
+    else:
+        rng = RANGE_TO.match(m)
+        port = rng.group(2) if rng else m.rsplit(":", 1)[-1]
+    port = port.split("-")[0]
+    host = "" if is_local(host) else host.strip("[]")
+    try:
+        return host, int(port)
+    except ValueError:
+        return None
+
+
+_EXITS_SCRIPT = r"""echo "@@NAT"
+{ iptables-save -t nat 2>/dev/null; ip6tables-save -t nat 2>/dev/null; } | grep -F -- '-j DNAT' | head -n 400
+command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -F 'dnat' | head -n 400
+# local and peer address of each ss line: the two fields before "users:(...)"
+cols() { awk '{for(i=1;i<=NF;i++) if ($i ~ /^users:/) {print $(i-2), $(i-1); break}}'; }
+for p in @PORTS@; do
+  echo "@@PORT $p"
+  pid=$(ss -ltnpH "sport = :$p" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2)
+  [ -n "$pid" ] || continue
+  c=$(cat /proc/$pid/comm 2>/dev/null)
+  echo "@@PID $pid ${c:--}"
+  echo "@@CMD $(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 600)"
+  lp=$(ss -ltnpH 2>/dev/null | grep -F "((\"$c\"," | cols | awk '{n=split($1,a,":"); print a[n]}' | sort -u | tr '\n' ' ')
+  ip=0
+  # a BackPack server here: the next kharej dials in on its tunnel port
+  [ "$c" = backpack ] && lp="$p" && ip=1
+  echo "@@OUT"
+  ss -tnpH state established 2>/dev/null | grep -F "((\"$c\"," | cols \
+    | awk -v lp=" $lp " -v ip=$ip '{n=split($1,a,":"); if (index(lp, " " a[n] " ")) next; if (ip) sub(/:[0-9]+$/, "", $2); print $2}' \
+    | grep -vE '^(127\.|\[::1\]|\[::ffff:127\.)' | sort | uniq -c | sort -rn | awk 'NR<=5 {print} END {print "@@DISTINCT " NR}'
+done
+echo "@@REACH"
+for t in @TARGETS@; do
+  h=${t%:*}; h=${h#[}; h=${h%]}; q=${t##*:}
+  if timeout 3 bash -c "</dev/tcp/$h/$q" 2>/dev/null; then echo "$t ok"; else echo "$t fail"; fi
+done
+echo "@@END"
+"""
+
+
+def exits_script(ports: list[int], targets: list[str]) -> str:
+    """Read-only: DNAT rules, who listens on each port, where that process's
+    own connections go; then a plain TCP connect to each known exit."""
+    return _EXITS_SCRIPT.replace("@PORTS@", " ".join(str(int(p)) for p in sorted(set(ports)))).replace(
+        "@TARGETS@", " ".join(shlex.quote(t) for t in targets if _TARGET.match(t))
+    )
+
+
+def _ports_in(spec: str) -> set[int]:
+    out: set[int] = set()
+    for part in spec.strip("{} ").replace(" ", "").split(","):
+        lo, _, hi = part.replace("-", ":").partition(":")
+        try:
+            a, b = int(lo), int(hi or lo)
+        except ValueError:
+            continue
+        out.update(range(a, min(b, a + 5000) + 1))
+    return out
+
+
+def _nat_target(dest: str, port: int) -> str:
+    dest = dest.split("-")[0]  # "1.2.3.4-1.2.3.5:443" -> the first address
+    if dest.startswith("["):
+        return dest if "]:" in dest else f"{dest}:{port}"
+    return dest if dest.count(":") == 1 else f"{dest}:{port}"
+
+
+def parse_nat(lines: list[str], port: int) -> tuple[list[str], str]:
+    """DNAT targets (iptables-save or nft syntax) for traffic to this port."""
+    out: list[str] = []
+    kind = ""
+    for line in lines:
+        m = re.search(r"--to-destination\s+(\S+)", line)
+        if m:
+            d, k = re.search(r"--dports?\s+(\S+)", line), "iptables"
+        else:
+            m = re.search(r"\bdnat(?:\s+ip6?)?\s+to\s+([^\s;]+)", line)
+            d, k = re.search(r"\bdport\s+(\{[^}]*\}|\S+)", line), "nftables"
+        if not m or not d or port not in _ports_in(d.group(1)):
+            continue
+        t = _nat_target(m.group(1), port)
+        kind = kind or k
+        if t not in out:
+            out.append(t)
+    return out, kind
+
+
+def parse_cmdline(comm: str, cmd: str, port: int) -> list[str]:
+    """The target a forwarder was started with, for the ones that say so on
+    their command line."""
+    name = comm.lower()
+    if "socat" in name:
+        for tok in cmd.split():
+            m = re.match(r"(?i)^(?:tcp[46]?|tcp[46]?-connect|openssl|openssl-connect):\[?([^\],]+?)\]?:(\d+)", tok)
+            if m:
+                return [f"{m.group(1)}:{m.group(2)}"]
+        return []
+    if "gost" in name:
+        fwd = re.search(r"-F[= ]+\S*?://(?:[^@\s/]*@)?([^:/\s]+):(\d+)", cmd)
+        if fwd:  # chained through another proxy: that one is the exit
+            return [f"{fwd.group(1)}:{fwd.group(2)}"]
+        for m in re.finditer(r"(?:tcp|rtcp|udp)://[^/\s]*:(\d+)/([^\s,?]+)", cmd):
+            if int(m.group(1)) == port:
+                return [m.group(2)]
+        return []
+    if "realm" in name:
+        m = re.search(r"(?:-r|--remote)[= ]+(\S+)", cmd)
+        return [m.group(1)] if m else []
+    return []
+
+
+def parse_exits(out: str, ports: list[int]) -> tuple[dict[int, dict[str, Any]], dict[str, bool]]:
+    """-> ({port: {"method", "targets", "via", "inferred"}}, {target: reachable})"""
+    nat = out.split("@@NAT", 1)[-1].split("@@PORT", 1)[0].split("@@REACH", 1)[0].splitlines()
+    exits: dict[int, dict[str, Any]] = {}
+    for chunk in out.split("@@PORT ")[1:]:
+        chunk = chunk.split("@@REACH", 1)[0]
+        head, _, body = chunk.partition("\n")
+        try:
+            port = int(head.strip())
+        except ValueError:
+            continue
+        targets, kind = parse_nat(nat, port)
+        if targets:
+            exits[port] = {"method": kind, "targets": targets, "via": "", "inferred": False}
+            continue
+        m = re.search(r"@@PID (\d+) (\S+)", body)
+        if not m:
+            continue
+        comm = "" if m.group(2) == "-" else m.group(2)
+        cm = re.search(r"@@CMD (.*)", body)
+        targets = parse_cmdline(comm, cm.group(1) if cm else "", port)
+        if targets:
+            exits[port] = {"method": comm, "targets": targets, "via": comm, "inferred": False}
+            continue
+        peers: list[tuple[int, str]] = []
+        distinct = 0
+        for line in body.split("@@OUT", 1)[-1].splitlines():
+            line = line.strip()
+            if line.startswith("@@DISTINCT"):
+                distinct = int(line.split()[1]) if line.split()[1:] and line.split()[1].isdigit() else 0
+                continue
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit():
+                peers.append((int(parts[0]), parts[1]))
+        total = sum(n for n, _ in peers)
+        # a forwarder talks to one or two upstreams; a service that browses
+        # the internet for its users (xray, a proxy...) talks to many
+        if peers and (distinct <= 2 or (distinct <= 5 and peers[0][0] >= 0.8 * total)):
+            keep = [t for n, t in peers if n >= 0.2 * peers[0][0]][:3]
+            exits[port] = {"method": comm or "?", "targets": keep, "via": comm, "inferred": True}
+    reach: dict[str, bool] = {}
+    for line in out.split("@@REACH", 1)[-1].splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] in ("ok", "fail"):
+            reach[parts[0]] = parts[1] == "ok"
+    return exits, reach
 
 
 def parse_scan(out: str) -> list[Found]:
@@ -439,6 +632,9 @@ class Driver:
 
     async def listening(self, s: Server) -> set[int]:
         return set()
+
+    async def exits(self, s: Server, ports: list[int], targets: list[str]) -> tuple[dict[int, dict[str, Any]], dict[str, bool]]:
+        return {}, {}
 
 
 class SSHDriver(Driver):
@@ -588,3 +784,7 @@ class SSHDriver(Driver):
     async def listening(self, s: Server) -> set[int]:
         r = await self.pool.run(s, LISTEN_SCRIPT, timeout=20)
         return parse_listening(r.out)
+
+    async def exits(self, s: Server, ports: list[int], targets: list[str]) -> tuple[dict[int, dict[str, Any]], dict[str, bool]]:
+        r = await self.pool.run(s, exits_script(ports, targets), timeout=20 + 4 * len(targets) + len(ports))
+        return parse_exits(r.out, ports)

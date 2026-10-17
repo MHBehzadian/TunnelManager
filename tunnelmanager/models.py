@@ -73,6 +73,12 @@ class Server(Model):
     error: str = ""
     fail_count: int = 0
     last_scan: float = 0
+    # kharej only, shown and never acted on: forwarded ports this server sends
+    # on to another server (port -> {"method", "targets", "via", "inferred",
+    # "seen"}), and whether each such exit answers from here (addr -> {"ok",
+    # "fails", "since"})
+    exits: dict[str, dict[str, Any]] = field(default_factory=dict)
+    exit_reach: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def probe_addr(self) -> str:
         return self.probe_target or f"127.0.0.1:{self.ssh_port}"

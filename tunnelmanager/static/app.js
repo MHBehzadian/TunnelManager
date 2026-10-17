@@ -71,6 +71,15 @@ const provider = (id) => S.providers.find((p) => p.id === id);
 const nowS = () => Date.now() / 1000 + skew;
 const linkName = (l) => (l ? `${nm(l.kharej_id)} ⇄ ${nm(l.iran_id)}` : "—");
 const linkTag = (l) => (l && l.label ? ` (${l.label})` : "");
+// where a port finally leaves from, when the kharej sends it on (only shown)
+const exitName = (t) => (t.server_id ? nm(t.server_id) : t.addr);
+const exitText = (e) => (e ? e.targets.map(exitName).join("، ") : "");
+const exitBad = (e) => !!e && e.targets.some((t) => t.ok === false);
+function serverExits(id) {
+  const out = {};
+  for (const l of S.links) if (l.kharej_id === id) for (const e of Object.values(l.exits || {})) out[`${e.port}|${e.method}`] ||= e;
+  return Object.values(out).sort((a, b) => a.port - b.port);
+}
 function linkCell(l, extra = "") {
   const st = lstatus(l);
   const sub = [l.label, l.transport, st === "up" ? ms(l.latency_ms) : FA[st]].filter(Boolean).join(" · ");
@@ -257,6 +266,11 @@ function fit() {
     const [x, y] = pos[id]; const el = els[id];
     x0 = Math.min(x0, x); y0 = Math.min(y0, y - 30); x1 = Math.max(x1, x + el.offsetWidth); y1 = Math.max(y1, y + el.offsetHeight);
   }
+  // labels of wires that loop outside the columns (kharej -> kharej forwards)
+  for (const g of $$(".wlabel.hop", wiresEl)) {
+    const m = /translate\(([-\d.]+),([-\d.]+)\)/.exec(g.getAttribute("transform") || "");
+    if (m) { x0 = Math.min(x0, +m[1]); x1 = Math.max(x1, +m[1] + g.getBBox().width); }
+  }
   const r = canvas.getBoundingClientRect();
   const top = 56, bottom = 60, pad = 30;
   const z = Math.min(1.15, (r.width - pad * 2) / (x1 - x0), (r.height - top - bottom) / (y1 - y0));
@@ -272,6 +286,8 @@ function serverCard(s) {
   const up = links.filter((l) => l.status === "up").length;
   const meta = [`<span class="chip">${up}/${links.length} تانل</span>`];
   if (s.ssh_latency_ms != null) meta.push(`<span class="chip mono" title="تأخیر SSH از پنل">ssh ${ms(s.ssh_latency_ms)}</span>`);
+  const ex = s.role === "kharej" ? serverExits(s.id) : [];
+  if (ex.length) meta.push(`<span class="chip ${ex.some(exitBad) ? "bad" : ""}" title="${esc(ex.map((e) => `${e.port} → ${exitText(e)} (${e.method})`).join("\n"))}">↪ ${ex.length} پورت به بیرون</span>`);
   if (s.role === "iran") {
     const doms = S.domains.filter((d) => d.iran_id === s.id).length;
     if (doms) meta.push(`<span class="chip info">${doms} دامنه</span>`);
@@ -290,7 +306,8 @@ function domainCard(d) {
   const routes = d.routes || [];
   for (const r of routes.slice(0, 4)) {
     const l = linkById(r.link_id);
-    meta.push(`<span class="chip mono ${r.healthy ? "" : "bad"}" title="${esc(l ? linkName(l) : "بدون تانل")}">${esc(r.spec)}→${esc(l ? nm(l.kharej_id) : "؟")}</span>`);
+    const ex = r.exit ? `↪${exitText(r.exit)}` : "";
+    meta.push(`<span class="chip mono ${r.healthy ? (exitBad(r.exit) ? "warn" : "") : "bad"}" title="${esc(l ? linkName(l) : "بدون تانل")}${r.exit ? esc(` · خروجی نهایی: ${exitText(r.exit)} (${r.exit.method})`) : ""}">${esc(r.spec)}→${esc(l ? nm(l.kharej_id) : "؟")}${esc(ex)}</span>`);
   }
   if (routes.length > 4) meta.push(`<span class="chip">+${routes.length - 4}</span>`);
   if (!routes.length && d.iran_id) meta.push(`<span class="chip warn">پورت مشخص نشده</span>`);
@@ -347,7 +364,7 @@ function renderCanvas() {
   if (firstState) {
     firstState = false;
     const sameScreen = view.cw && Math.abs(view.cw - canvas.clientWidth) / canvas.clientWidth < 0.3;
-    if (viewRestored && sameScreen) applyView(); else requestAnimationFrame(fit);
+    if (viewRestored && sameScreen) applyView(); else requestAnimationFrame(() => { drawWiresNow(); fit(); });
   }
   drawWires();
 }
@@ -378,8 +395,8 @@ function box(id) {
   const [x, y] = pos[id];
   return { x, y, w: el.offsetWidth, h: el.offsetHeight, cx: x + el.offsetWidth / 2, cy: y + el.offsetHeight / 2 };
 }
-function bezier(x1, y1, x2, y2, dir1, dir2) {
-  const dx = Math.max(50, Math.abs(x2 - x1) * 0.45);
+function bezier(x1, y1, x2, y2, dir1, dir2, bulge) {
+  const dx = bulge || Math.max(50, Math.abs(x2 - x1) * 0.45);
   const p = [x1, y1, x1 + dx * dir1, y1, x2 + dx * dir2, y2, x2, y2];
   return { d: `M${p[0]},${p[1]} C${p[2]},${p[3]} ${p[4]},${p[5]} ${p[6]},${p[7]}`, p };
 }
@@ -418,11 +435,27 @@ function drawWiresNow() {
     if (!a || !b) continue;
     edges.push({ kind: "domain", d, from: d.iran_id, to: d.id, a, b });
   }
+  // kharej -> another registered server the kharej sends ports on to
+  for (const k of byRole("kharej")) {
+    const to = {};
+    for (const e of serverExits(k.id)) for (const t of e.targets) {
+      if (!t.server_id || t.server_id === k.id) continue;
+      const g = (to[t.server_id] ||= { ports: [], methods: new Set(), bad: false });
+      if (!g.ports.includes(e.port)) g.ports.push(e.port);
+      g.methods.add(e.method);
+      g.bad ||= t.ok === false;
+    }
+    for (const [tid, g] of Object.entries(to)) {
+      const a = box(k.id), b = box(tid);
+      if (a && b) edges.push({ kind: "hop", from: k.id, to: tid, a, b, g });
+    }
+  }
   // spread the anchor points along each node side, ordered by the far end
   const sides = {};
   for (const e of edges) {
-    e.dir1 = e.b.cx >= e.a.cx ? 1 : -1;
-    e.dir2 = -e.dir1;
+    e.loop = e.kind === "hop" && Math.abs(e.b.cx - e.a.cx) < NODE_W;
+    e.dir1 = e.loop ? -1 : e.b.cx >= e.a.cx ? 1 : -1;
+    e.dir2 = e.loop ? -1 : -e.dir1;
     (sides[`${e.from}|${e.dir1}`] ||= []).push([e, "a"]);
     (sides[`${e.to}|${e.dir2}`] ||= []).push([e, "b"]);
   }
@@ -445,8 +478,16 @@ function drawWiresNow() {
   for (const e of edges) {
     const x1 = e.dir1 > 0 ? e.a.x + e.a.w : e.a.x;
     const x2 = e.dir2 > 0 ? e.b.x + e.b.w : e.b.x;
-    const c = bezier(x1, e.y_a, x2, e.y_b, e.dir1, e.dir2);
-    if (e.kind === "link") {
+    const c = bezier(x1, e.y_a, x2, e.y_b, e.dir1, e.dir2, e.loop ? 30 + Math.abs(e.y_b - e.y_a) * 0.1 : 0);
+    if (e.kind === "hop") {
+      const hop = `${e.from}|${e.to}`;
+      parts.push(`<path class="xwire ${e.g.bad ? "down" : ""}" d="${c.d}" data-hop="${hop}"/>`);
+      const txt = `↪ ${e.g.ports.join(",")} · ${[...e.g.methods].join("/")}${e.g.bad ? " ✕" : ""}`;
+      const w = txt.length * 6.5 + 14;
+      // a loop between two kharejs: hang the label outside the curve, clear of the cards
+      const [lx, ly] = e.loop ? ((p) => [p[0] - w / 2 - 4, p[1]])(bezAt(c.p, 0.5)) : placeLabel(c, w);
+      labels.push(`<g class="wlabel hop ${e.g.bad ? "down" : ""}" data-hop="${hop}" transform="translate(${(lx - w / 2).toFixed(1)},${(ly - 10).toFixed(1)})"><rect width="${w.toFixed(1)}" height="20" rx="10"/><text x="${(w / 2).toFixed(1)}" y="14" text-anchor="middle">${esc(txt)}</text></g>`);
+    } else if (e.kind === "link") {
       const l = e.l;
       const moved = handedOver(l) && e.st === "up";
       const cls = `wire ${moved ? "handover" : e.st}${e.act ? " active" : ""}${e.standby ? " standby" : ""}`;
@@ -581,9 +622,16 @@ function relatedTo(type, id) {
   const addLink = (l) => { if (!l) return; links.add(l.id); nodes.add(l.iran_id); nodes.add(l.kharej_id); };
   if (type === "domain") {
     const d = S.domains.find((x) => x.id === id);
-    if (d) { domains.add(d.id); if (d.iran_id) nodes.add(d.iran_id); for (const r of d.routes || []) addLink(linkById(r.link_id)); }
+    if (d) {
+      domains.add(d.id); if (d.iran_id) nodes.add(d.iran_id);
+      for (const r of d.routes || []) { addLink(linkById(r.link_id)); for (const t of (r.exit || {}).targets || []) if (t.server_id) nodes.add(t.server_id); }
+    }
   } else if (type === "server") {
     for (const l of S.links) if (l.iran_id === id || l.kharej_id === id) addLink(l);
+    for (const k of byRole("kharej")) for (const e of serverExits(k.id)) for (const t of e.targets) {
+      if (k.id === id && t.server_id) nodes.add(t.server_id);
+      if (t.server_id === id) nodes.add(k.id);
+    }
     for (const d of S.domains) {
       const via = (d.routes || []).map((r) => linkById(r.link_id)).filter(Boolean);
       if (d.iran_id === id || via.some((l) => l.kharej_id === id)) { domains.add(d.id); nodes.add(d.id); }
@@ -597,10 +645,12 @@ function relatedTo(type, id) {
 function applyFocus() {
   world.classList.toggle("focus", !!focus);
   for (const [id, el] of Object.entries(els)) el.classList.toggle("hl", !!focus && focus.nodes.has(id));
-  $$("#wires [data-link], #wires [data-domain]").forEach((el) => {
+  $$("#wires [data-link], #wires [data-domain], #wires [data-hop]").forEach((el) => {
     if (el.classList.contains("hit")) return;
     if (!focus) { el.classList.remove("dim", "hl"); return; }
-    const on = el.dataset.link ? focus.links.has(el.dataset.link) : focus.domains.has(el.dataset.domain);
+    const hop = el.dataset.hop && el.dataset.hop.split("|");
+    const on = hop ? focus.nodes.has(hop[0]) && focus.nodes.has(hop[1])
+      : el.dataset.link ? focus.links.has(el.dataset.link) : focus.domains.has(el.dataset.domain);
     el.classList.toggle("dim", !on);
     el.classList.toggle("hl", on && el.classList.contains("wire"));
   });
@@ -735,6 +785,7 @@ function linkDrawer() {
   <div class="box"><h4>پورت‌های فورواردی — سمت سرور داخل (${esc(nm(l.iran_id))})</h4>
     <textarea id="lp-ports" placeholder="443&#10;8443=2096&#10;2053-2060">${esc((l.ports || []).join("\n"))}</textarea>
     <p class="hint">هر خط یک پورت: «<span class="mono">443</span>» یعنی پورت 443 این سرور داخل به همان پورت روی سرور خارج می‌رود؛ «<span class="mono">8443=2096</span>» یعنی 8443 داخل به 2096 خارج؛ «<span class="mono">2053-2060</span>» یک بازه.</p>
+    ${Object.keys(l.exits || {}).length ? `<div class="opt-list">${Object.entries(l.exits).map(([spec, e]) => `<div class="opt"><span class="dot ${exitBad(e) ? "down" : "up"}"></span><span class="grow"><span dir="ltr" style="text-align:right"><span class="mono">${esc(spec)}</span> → ${esc(nm(l.kharej_id))} ↪ ${esc(exitText(e))}</span>${exitLine(e)}</span></div>`).join("")}</div>` : ""}
     <label class="check"><input type="checkbox" id="lp-udp" ${l.accept_udp ? "checked" : ""}> UDP هم فوروارد شود</label>
     <label class="check"><input type="checkbox" id="lp-all"> همین پورت‌ها روی همه تانل‌های ${esc(nm(l.kharej_id))} تنظیم شود</label>
     <div class="btns"><button class="btn primary sm" data-save-ports="${l.id}">ذخیره و اعمال</button></div>
@@ -786,6 +837,9 @@ function serverDrawer() {
   <div class="box"><h4>تانل‌ها (${built.length})</h4><div class="opt-list">${built.map(row).join("") || "<span class='muted small'>—</span>"}</div>
     <div class="btns"><button class="btn sm" data-new-link="${s.id}">＋ تانل جدید</button>
     ${broken.length ? `<button class="btn sm" data-discover-links="${broken.map((l) => l.id).join(",")}">ساخت دوباره تانل‌های قطع</button>` : ""}</div></div>
+  ${s.role === "kharej" && serverExits(s.id).length ? `<div class="box"><h4>پورت‌هایی که از سرور دیگری خارج می‌شوند</h4>
+    <div class="opt-list">${serverExits(s.id).map((e) => `<div class="opt"><span class="dot ${exitBad(e) ? "down" : "up"}"></span><span class="grow"><span dir="ltr" style="text-align:right"><span class="mono">${e.port}</span> ↪ ${esc(exitText(e))}</span>${exitLine(e)}</span></div>`).join("")}</div>
+    <p class="hint">پنل این‌ها را فقط از روی سرور می‌خواند و نشان می‌دهد (iptables/nft، socat، gost، realm و اتصال‌های پروسه‌ای که روی پورت گوش می‌دهد)؛ چیزی را در این مرحله تغییر نمی‌دهد.</p></div>` : ""}
   ${offers.length ? `<div class="box"><h4>جفت‌هایی که تانل ندارند</h4><div class="opt-list">${offers.map(row).join("")}</div>
     <div class="btns"><button class="btn sm" data-discover-links="${offers.map((l) => l.id).join(",")}">ساخت با بهترین پروتکل</button></div></div>` : ""}`;
 }
@@ -796,6 +850,11 @@ function failbackText(d) {
   if (f.wait < 0) return `سرور اصلی ${name} هنوز همه پورت‌های این دامنه را سالم ندارد`;
   const left = f.wait - (nowS() - S.now);
   return left > 0 ? `برگشت به سرور اصلی ${name} بعد از ${dur(left)} پایداری دیگر` : `برگشت به سرور اصلی ${name} در بررسی بعدی`;
+}
+function exitLine(e) {
+  if (!e) return "";
+  const st = e.targets.map((t) => `${esc(exitName(t))}${t.server_id ? ` <span class="mono muted">${esc(t.addr)}</span>` : ""} ${t.ok === false ? "<b style='color:var(--down)'>جواب نمی‌دهد</b>" : t.ok ? "<span style='color:var(--up)'>✓</span>" : ""}`).join("، ");
+  return `<span class="sub">خروجی نهایی: ${st} <span class="muted">(${esc(e.method)}${e.inferred ? "، از روی اتصال‌ها" : ""})</span></span>`;
 }
 function domainDrawer() {
   const d = S.domains.find((x) => x.id === drawer.id);
@@ -808,7 +867,7 @@ function domainDrawer() {
     const st = l ? lstatus(l) : "down";
     const sub = l ? [l.label, l.transport, st === "up" ? ms(l.latency_ms) : FA[st]].filter(Boolean).join(" · ") : "هیچ تانلی این پورت را روی این سرور باز نکرده";
     return `<div class="opt"><span class="dot ${r.healthy ? "up" : st}"></span>
-      <span class="grow"><span dir="ltr" style="text-align:right"><span class="mono">${esc(r.spec)}</span> → ${esc(l ? nm(l.kharej_id) : "؟")}</span><span class="sub mono">${esc(sub)}</span></span>
+      <span class="grow"><span dir="ltr" style="text-align:right"><span class="mono">${esc(r.spec)}</span> → ${esc(l ? nm(l.kharej_id) : "؟")}${r.exit ? ` ↪ ${esc(exitText(r.exit))}` : ""}</span><span class="sub mono">${esc(sub)}</span>${exitLine(r.exit)}</span>
       ${l ? `<button class="btn sm" data-link="${l.id}">تانل</button>` : ""}</div>`;
   }).join("");
   // 2. which ports this domain uses: pick from what the Iran server exposes
@@ -817,7 +876,7 @@ function domainDrawer() {
     for (const spec of l.ports || []) if (!offered.some((o) => o.spec === spec)) offered.push({ spec, l });
   }
   for (const spec of d.specs || []) if (!offered.some((o) => o.spec === spec)) offered.push({ spec, l: null });
-  const picker = offered.map((o) => `<label><input type="checkbox" class="dp-port" value="${esc(o.spec)}" ${(d.specs || []).includes(o.spec) ? "checked" : ""}><span dir="ltr">${esc(o.spec)} <span class="muted small">→ ${esc(o.l ? nm(o.l.kharej_id) : "؟")}</span></span></label>`).join("");
+  const picker = offered.map((o) => `<label><input type="checkbox" class="dp-port" value="${esc(o.spec)}" ${(d.specs || []).includes(o.spec) ? "checked" : ""}><span dir="ltr">${esc(o.spec)} <span class="muted small">→ ${esc(o.l ? nm(o.l.kharej_id) : "؟")}${o.l && (o.l.exits || {})[o.spec] ? ` ↪ ${esc(exitText(o.l.exits[o.spec]))}` : ""}</span></span></label>`).join("");
   // 3. every Iran server: can it carry all of the domain's ports?
   const cov = (d.coverage || []).map((c) => {
     const s = srv(c.iran_id);
