@@ -846,7 +846,9 @@ function domainDrawer() {
   return `${head(`<span class="mono">${esc(d.fqdn)}</span>`, `${p ? `<span class="prov ${p.kind}">${p.kind === "cloudflare" ? "Cloudflare" : "ArvanCloud"}</span> ${esc(p.name)}` : "بدون حساب DNS"}`, d.status)}
   <div class="box"><h4>مسیر ترافیک</h4>
     <div class="path"><span class="chip">کاربر</span><span class="arrow">→</span><span class="chip mono">${esc(d.fqdn)}</span><span class="arrow">→</span><span class="chip">${esc(iran ? `${iran.name} ${iran.ip}` : "—")}</span></div>
-    ${iran ? "" : `<p class="note" style="color:var(--degraded)">رکورد این دامنه به هیچ‌کدام از سرورهای داخل ثبت‌شده اشاره نمی‌کند. از لیست «سرورهای داخل» پایین، سرور درست را انتخاب کنید.</p>`}
+    ${iran ? "" : (d.error || "").startsWith("DNS read") && !d.current_ip
+      ? `<p class="note" style="color:var(--degraded)">رکورد این دامنه از DNS خوانده نشد (خطا پایین). تا درست شود، پنل هر ۵ دقیقه دوباره تلاش می‌کند و هیچ تغییری در رکورد نمی‌دهد.</p>`
+      : `<p class="note" style="color:var(--degraded)">رکورد این دامنه به هیچ‌کدام از سرورهای داخل ثبت‌شده اشاره نمی‌کند. از لیست «سرورهای داخل» پایین، سرور درست را انتخاب کنید.</p>`}
     ${d.pending_ip ? `<p class="note" style="color:var(--degraded)">رکورد به <span class="mono">${esc(d.pending_ip)}</span> تغییر کرده؛ در انتظار رسیدن تغییر به DNSهای عمومی (${ago(d.pending_since)})…</p>` : ""}
     ${fb ? `<p class="note"><span id="failback-timer">${esc(fb)}</span></p>` : ""}
     <dl class="kv"><dt>آی‌پی رکورد</dt><dd class="mono">${esc(d.current_ip || "—")}</dd><dt>TTL</dt><dd class="mono">${d.ttl}s</dd>

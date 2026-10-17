@@ -58,6 +58,32 @@ async def test_observe_mode_never_points_a_record_somewhere_new(world):
     assert w.said("رکورد دست نخورد") and w.dom.iran_id == ""
 
 
+
+
+async def test_unreadable_record_is_retried_and_never_written(world):
+    w = world
+    from tunnelmanager.dns.base import DNSError
+
+    reads = []
+
+    class Refusing(FakeDNS):
+        async def get_a(self, fqdn):
+            reads.append(fqdn)
+            raise DNSError("arvan: HTTP 403: Your access to this section is restricted.")
+
+    w.orch.dns_factory = Refusing
+    w.dom.current_ip = ""
+    await w.orch.read_record(w.dom)
+    assert w.dom.error.startswith("DNS read") and w.said("خوانده نشد")
+    await w.settle(2)
+    assert len(reads) == 1  # not hammered every check
+    assert not w.said("هیچ‌کدام از سرورهای داخل")  # the panel does not know where it points
+    w.orch.last_read[w.dom.id] -= 301
+    w.orch.dns_factory = FakeDNS
+    FakeDNS.records[w.dom.fqdn] = w.i1.ip
+    await w.settle(2)
+    assert w.dom.error == "" and w.dom.iran_id == w.i1.id
+    assert FakeDNS.calls == []
 async def test_only_running_tunnels_are_adopted_and_their_units_kept(world):
     w = world
     w.net.plant(w.i1, w.k1, "live", "tcpmux", 4000, ["443"], unit="my-tunnel.service")

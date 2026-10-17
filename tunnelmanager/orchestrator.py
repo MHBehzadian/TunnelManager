@@ -94,6 +94,7 @@ class Orchestrator:
         self.prev_ok: dict[str, bool] = {}
         self.flap_reported: set[str] = set()
         self.suggested: dict[str, str] = {}  # observe mode: domain id -> what was proposed
+        self.last_read: dict[str, float] = {}  # domain id -> when its record was last read
         self.tasks: set[asyncio.Task] = set()
         self._check_lock = asyncio.Lock()
         self._dns_lock = asyncio.Lock()
@@ -957,6 +958,26 @@ class Orchestrator:
             domain=d.id,
         )
 
+    async def read_record(self, d: Domain) -> None:
+        """Read the live A record, so a domain that already points at one of
+        our Iran servers starts from there instead of changing DNS."""
+        p = self.store.providers.get(d.provider_id)
+        if not p:
+            return
+        self.last_read[d.id] = time.time()
+        try:
+            ips = await self.dns_factory(p).get_a(d.fqdn)
+        except Exception as e:
+            err = f"DNS read: {e}"
+            if d.error != err:
+                d.error = err
+                await self.emit("error", "dns", f"رکورد دامنه {d.fqdn} خوانده نشد: {e}", domain=d.id)
+            await self.changed()
+            return
+        d.current_ip, d.error = (ips[0] if ips else ""), ""
+        await self.changed()
+        self.wake()
+
     async def _assign_initial(self, d: Domain) -> None:
         """A domain without an Iran server yet: take the one its record
         already points at, and the ports it serves there."""
@@ -974,6 +995,11 @@ class Orchestrator:
             return
         if not d.current_ip and not d.error:
             return  # the record has not been read yet
+        if d.error.startswith("DNS read"):
+            # the provider refused; try again now and then (the fix is on its side)
+            if time.time() - self.last_read.get(d.id, 0) >= 300:
+                self.spawn(self.read_record(d))
+            return
         if self.suggested.get(d.id) != f"init:{d.current_ip}":
             self.suggested[d.id] = f"init:{d.current_ip}"
             await self.emit(

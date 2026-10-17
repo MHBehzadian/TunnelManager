@@ -556,20 +556,7 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
 
     # ---- domains -----------------------------------------------------
     async def adopt_record(d: Domain) -> None:
-        """Read the live A record, so a domain that already points at one of
-        our Iran servers starts from there instead of changing DNS."""
-        p = store.providers.get(d.provider_id)
-        if not p:
-            return
-        try:
-            ips = await dns_factory(p).get_a(d.fqdn)
-        except Exception as e:
-            d.error = f"DNS read: {e}"
-            await orch.changed()
-            return
-        d.current_ip = ips[0] if ips else ""
-        await orch.changed()
-        orch.wake()
+        await orch.read_record(d)
 
     def check_domain(body: DomainIn) -> None:
         p = get(store.providers, body.provider_id)

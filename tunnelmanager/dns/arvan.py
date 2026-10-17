@@ -6,6 +6,14 @@ from .base import DNSClient, DNSError
 
 API = "https://napi.arvancloud.ir/cdn/4.0"
 
+# what the usual refusals mean, in the panel's language
+HINTS = {
+    401: "کلید API نامعتبر یا منقضی است",
+    403: "این کلید به بخش DNS این دامنه دسترسی ندارد؛ در IAM آروان به کاربر ماشینیِ کلید، "
+    "روی این دامنه دسترسی DNS (خواندن و نوشتن) بدهید. اگر دسترسی کامل است، حساب محدود شده (مثلاً بدهی)",
+    404: "این Zone در حساب صاحب کلید پیدا نشد (Zone باید دامنه اصلی باشد، مثل example.com)",
+}
+
 
 class ArvanDNS(DNSClient):
     def _c(self):
@@ -21,7 +29,8 @@ class ArvanDNS(DNSClient):
                 msg = r.json().get("message") or r.text
             except ValueError:
                 msg = r.text
-            raise DNSError(f"arvan: HTTP {r.status_code}: {str(msg)[:200]}")
+            hint = HINTS.get(r.status_code)
+            raise DNSError(f"arvan: HTTP {r.status_code}: {str(msg)[:200]}" + (f" — {hint}" if hint else ""))
         return r.json()
 
     @property
