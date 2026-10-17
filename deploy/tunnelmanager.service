@@ -10,6 +10,11 @@ EnvironmentFile=-/etc/default/tunnelmanager
 ExecStart=/opt/tunnelmanager/venv/bin/python -m tunnelmanager --data /var/lib/tunnelmanager serve
 Restart=always
 RestartSec=3
+# The panel shares servers with live tunnels: it must never compete with them.
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryMax=400M
 
 [Install]
 WantedBy=multi-user.target
