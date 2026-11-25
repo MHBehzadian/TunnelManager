@@ -2,4 +2,4 @@
 reverse tunnels between Iran and kharej servers, and moves DNS records
 (Cloudflare / ArvanCloud) when a path dies."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

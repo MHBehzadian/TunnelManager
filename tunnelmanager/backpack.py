@@ -23,6 +23,7 @@ its metrics file) or an established connection on the tunnel port is used.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import logging
@@ -40,6 +41,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .models import TCP_TRANSPORTS, Link, Server
 from .ssh import SSHError, SSHPool
@@ -50,6 +53,16 @@ BIN_PATH = "/usr/local/bin/backpack"
 CONF_DIR = "/etc/backpack"
 UNIT_DIR = "/etc/systemd/system"
 RELEASE_URL = "https://github.com/AminMGMT/BackPack/releases/{path}"
+# BackPack's release key (internal/app/app.go, ReleasePublicKey). Every
+# release since v1.8 signs "backpack release <tag>\n" + SHA256SUMS with it.
+# The checksum list alone travels the same channel as the archive (a mirror
+# that swaps one swaps both); this key came with the panel, not the download.
+RELEASE_KEY = "uDVeC9NUFceAuhg53ZWbBNTVSaMC8tEvtwWmcDZmV9Q="
+
+# A BackPack server that cannot pair a user with the kharej logs "the queue is
+# full, dropping a client" and closes the connection. A tunnel in that state
+# still reports itself connected, so the health check counts these lines.
+STALL_WINDOW = 60  # seconds of journal the check reads
 
 ARCH = {
     "x86_64": "amd64",
@@ -82,6 +95,7 @@ class Probe:
     connect_s: float | None = None
     verified: bool = True
     error: str = ""
+    dropped: int = 0  # users refused in the last STALL_WINDOW seconds (queue full)
 
 
 @dataclass
@@ -245,8 +259,9 @@ def _probe_snippet(port: int) -> str:
 
 def check_script(links: list[Link]) -> str:
     """One round trip per Iran server: unit state, the engine's own view, an
-    end-to-end probe where the tunnel has one, and established connections
-    on the tunnel port (from /proc, no tools needed) as the last resort."""
+    end-to-end probe where the tunnel has one, established connections on
+    the tunnel port (from /proc, no tools needed) as the last resort, and how
+    many users the engine turned away in the last minute."""
     parts = []
     for x in links:
         n = shlex.quote(x.iran_name)
@@ -260,7 +275,8 @@ def check_script(links: list[Link]) -> str:
 c=$(grep -o '"connected": *[a-z]*' {CONF_DIR}/{n}.metrics.json 2>/dev/null | grep -o '[a-z]*$')
 {probe}
 e=$(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '{{ split($2,a,":"); if (a[2]=="{x.tunnel_port:04X}" && $4=="01") n++ }} END {{ print n+0 }}')
-echo "@@{x.id}|$a|$c|$p|$(( (t1-t0)/1000 ))|$e"
+q=$(journalctl -u {u} -q --no-pager --since "-{STALL_WINDOW}s" 2>/dev/null | grep -c "queue is full")
+echo "@@{x.id}|$a|$c|$p|$(( (t1-t0)/1000 ))|$e|${{q:-0}}"
 """
         )
     return "".join(parts)
@@ -276,6 +292,7 @@ def parse_check(out: str, links: dict[str, Link] | None = None) -> dict[str, Pro
             continue
         lid, active, conn, ok, us = parts[:5]
         estab = int(parts[5]) if len(parts) > 5 and parts[5].strip().isdigit() else 0
+        dropped = int(parts[6]) if len(parts) > 6 and parts[6].strip().isdigit() else 0
         connected = None if conn == "" else conn == "true"
         if ok in ("0", "1"):
             good = ok == "1"
@@ -284,6 +301,7 @@ def parse_check(out: str, links: dict[str, Link] | None = None) -> dict[str, Pro
                 active=active,
                 connected=connected,
                 latency_ms=round(int(us) / 1000, 1) if good and us.isdigit() else None,
+                dropped=dropped,
             )
             continue
         # no probe port: infer from the engine, then from the socket table
@@ -297,8 +315,78 @@ def parse_check(out: str, links: dict[str, Link] | None = None) -> dict[str, Pro
             good = estab > 0
         else:
             good = True  # a running datagram tunnel we cannot see into
-        res[lid] = Probe(ok=good, active=active, connected=connected, verified=False)
+        res[lid] = Probe(ok=good, active=active, connected=connected, verified=False, dropped=dropped)
     return res
+
+
+# ---------------------------------------------------------------- host
+# What a server has left to run its tunnels on. A BackPack engine under heavy
+# load can grow to gigabytes; when memory runs out the kernel kills it (or the
+# Xray behind it) and every user on it drops at once. Read-only.
+OOM_WINDOW = "-24h"
+HOST_SCRIPT = f"""echo "@@CPU $(nproc 2>/dev/null)"
+echo "@@LOAD $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo 2>/dev/null
+echo "@@BP $({BIN_PATH} -v 2>/dev/null | head -n1)"
+echo "@@OOM"
+journalctl -k -q --no-pager -o short-unix --since "{OOM_WINDOW}" 2>/dev/null | grep -F "Killed process" | tail -n 30
+echo "@@END"
+"""
+
+_OOM = re.compile(r"^(\d+)(?:\.\d+)?\s.*?Killed process (\d+) \(([^)]*)\)(?:.*?anon-rss:(\d+)kB)?")
+
+
+def parse_host(out: str) -> dict[str, Any]:
+    """-> {"cpus", "load": [1m, 5m, 15m], "mem_total", "mem_avail",
+    "swap_total", "swap_free" (MB), "version", "ooms": [{"ts", "pid",
+    "proc", "rss_mb"}]}. Missing readings are left out."""
+    info: dict[str, Any] = {"ooms": []}
+    mem = {"MemTotal": "mem_total", "MemAvailable": "mem_avail", "SwapTotal": "swap_total", "SwapFree": "swap_free"}
+    section = ""
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("@@CPU"):
+            n = line[5:].strip()
+            if n.isdigit():
+                info["cpus"] = int(n)
+        elif line.startswith("@@LOAD"):
+            try:
+                info["load"] = [float(x) for x in line[6:].split()[:3]]
+            except ValueError:
+                pass
+        elif line.startswith("@@BP"):
+            v = line[4:].strip()
+            if v.startswith("v"):
+                info["version"] = v.split()[0]
+        elif line.startswith("@@OOM"):
+            section = "oom"
+        elif line.startswith("@@END"):
+            section = ""
+        elif section == "oom":
+            m = _OOM.match(line)
+            if m:
+                info["ooms"].append({
+                    "ts": int(m.group(1)),
+                    "pid": int(m.group(2)),
+                    "proc": m.group(3),
+                    "rss_mb": round(int(m.group(4)) / 1024) if m.group(4) else None,
+                })
+        else:
+            key, _, rest = line.partition(":")
+            if key in mem and rest.split() and rest.split()[0].isdigit():
+                info[mem[key]] = round(int(rest.split()[0]) / 1024)
+    return info
+
+
+# ------------------------------------------------------------- releases
+def verify_release(tag: str, sums: bytes, sig: bytes, key: str = RELEASE_KEY) -> bool:
+    """Is this checksum list what the BackPack publisher signed for this tag?"""
+    try:
+        raw = base64.b64decode(sig.strip(), validate=True)
+        Ed25519PublicKey.from_public_bytes(base64.b64decode(key)).verify(raw, b"backpack release " + tag.encode() + b"\n" + sums)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
 
 
 def wait_script(port: int, timeout: int, samples: int = 5) -> str:
@@ -633,6 +721,9 @@ class Driver:
     async def listening(self, s: Server) -> set[int]:
         return set()
 
+    async def host(self, s: Server) -> dict[str, Any]:
+        return {}
+
     async def exits(self, s: Server, ports: list[int], targets: list[str]) -> tuple[dict[int, dict[str, Any]], dict[str, bool]]:
         return {}, {}
 
@@ -656,21 +747,39 @@ class SSHDriver(Driver):
         return lines[0].strip(), lines[1].strip()
 
     async def _binary(self, arch: str) -> bytes:
-        """Fetch the release tarball once, verify its checksum, return the
-        binary. Servers in Iran often cannot reach GitHub, so the panel
-        downloads and pushes it over SSH. A tarball dropped into the cache
-        directory by hand is used as is."""
+        """Fetch the release tarball once, verify it, return the binary.
+        Servers in Iran often cannot reach GitHub, so the panel downloads and
+        pushes it over SSH. The checksum list must carry the publisher's
+        signature for the tag; a release without one is refused. A tarball
+        dropped into the cache directory by hand is used as is (check its
+        SHA-256 against the release before putting it there)."""
         name = f"backpack_linux_{arch}.tar.gz"
         tag = self.release
         path = self.cache_dir / tag / name
         async with self._dl_lock:
             if not path.exists():
-                rel = "latest/download" if tag == "latest" else f"download/{tag}"
                 async with httpx.AsyncClient(follow_redirects=True, timeout=120) as c:
-                    sums = (await c.get(RELEASE_URL.format(path=f"{rel}/SHA256SUMS"))).raise_for_status().text
-                    blob = (await c.get(RELEASE_URL.format(path=f"{rel}/{name}"))).raise_for_status().content
-                want = next((ln.split()[0] for ln in sums.splitlines() if ln.strip().endswith(name)), None)
-                if want and hashlib.sha256(blob).hexdigest() != want:
+                    if tag == "latest":
+                        # the signature covers the tag, so find out which one "latest" is
+                        r = await c.get(RELEASE_URL.format(path="latest"))
+                        real = r.url.path.rstrip("/").rsplit("/", 1)[-1]
+                        if not real.startswith("v"):
+                            raise DeployError(f"could not tell which release is the latest ({r.url})")
+                    else:
+                        real = tag
+                    base = f"download/{real}"
+                    sums = (await c.get(RELEASE_URL.format(path=f"{base}/SHA256SUMS"))).raise_for_status().content
+                    sig = await c.get(RELEASE_URL.format(path=f"{base}/SHA256SUMS.sig"))
+                    if sig.status_code != 200 or not verify_release(real, sums, sig.content):
+                        raise DeployError(
+                            f"BackPack {real}: the checksum list is not signed by the BackPack release key, so it was not installed. "
+                            f"Verify {name} by hand and put it in {self.cache_dir / tag}/ to use it anyway."
+                        )
+                    blob = (await c.get(RELEASE_URL.format(path=f"{base}/{name}"))).raise_for_status().content
+                want = next((ln.split()[0] for ln in sums.decode(errors="replace").splitlines() if ln.strip().endswith(name)), None)
+                if want is None:
+                    raise DeployError(f"BackPack {real} publishes no checksum for {name}")
+                if hashlib.sha256(blob).hexdigest() != want:
                     raise DeployError(f"checksum mismatch for {name}")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(blob)
@@ -784,6 +893,10 @@ class SSHDriver(Driver):
     async def listening(self, s: Server) -> set[int]:
         r = await self.pool.run(s, LISTEN_SCRIPT, timeout=20)
         return parse_listening(r.out)
+
+    async def host(self, s: Server) -> dict[str, Any]:
+        r = await self.pool.run(s, HOST_SCRIPT, timeout=30)
+        return parse_host(r.out)
 
     async def exits(self, s: Server, ports: list[int], targets: list[str]) -> tuple[dict[int, dict[str, Any]], dict[str, bool]]:
         r = await self.pool.run(s, exits_script(ports, targets), timeout=20 + 4 * len(targets) + len(ports))

@@ -28,11 +28,12 @@ Every step is reported to Telegram.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import ipaddress
 import logging
 import socket
 import time
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from .backpack import DeployError, Driver, Found, Probe, listen_ports, split_ports, target_host, unit_name
 from .dns import DNSClient
@@ -102,6 +103,10 @@ class Orchestrator:
         self.last_check: float = 0
         self.last_scan: float = 0
         self.last_exits: float = 0
+        self.last_hosts: float = 0
+        # warnings that are sent once and again only when they change:
+        # key ("ver:<link>", "clash:<a>:<b>", "mem:<server>") -> what was said
+        self.reported: dict[str, str] = {}
 
     def reset(self) -> None:
         """Forget everything learnt at run time (after the state is replaced
@@ -112,7 +117,8 @@ class Orchestrator:
         self.flap_reported.clear()
         self.suggested.clear()
         self.last_read.clear()
-        self.last_scan = self.last_exits = 0
+        self.reported.clear()
+        self.last_scan = self.last_exits = self.last_hosts = 0
         self.wake()
 
     # ------------------------------------------------------------------ util
@@ -176,6 +182,11 @@ class Orchestrator:
 
     def flapping(self, link: Link) -> bool:
         return link.flapping(self.s.flap_window, self.s.flap_count)
+
+    def stalled(self, p: Probe | None) -> bool:
+        """Connected, but turning users away: the engine cannot pair them with
+        the kharej (BackPack's "the queue is full, dropping a client")."""
+        return p is not None and self.s.stall_drops > 0 and p.dropped >= self.s.stall_drops
 
     def healthy(self, link: Link | None) -> bool:
         if link is None or link.status != L_UP or link.id in self.busy:
@@ -408,8 +419,9 @@ class Orchestrator:
                 ranked = [t for t in link.ranked_transports(self.s.candidate_transports) if t != current]
                 probe = self.last_probe.get(link.id)
                 crashed = probe is not None and probe.active not in ("active", "")
-                # a service that died only needs a restart; a blocked
-                # transport is better tried last
+                # a service that died, or one stuck turning users away, only
+                # needs a restart; a blocked transport is better tried last
+                crashed = crashed or self.stalled(probe)
                 order = ([current] + ranked if crashed else ranked + [current]) if current else ranked
             await self.emit("warning", "repair", f"تانل {self.link_label(link)} ({current or '—'}) قطع است؛ تلاش برای بازسازی با: {', '.join(order)}", link=link.id)
             ports = self.store.link_ports(link)
@@ -650,6 +662,9 @@ class Orchestrator:
         t = time.time()
         if p is not None:
             self.last_probe[link.id] = p
+            link.dropped = p.dropped
+            if p.ok and self.stalled(p):
+                p = dataclasses.replace(p, ok=False)
         if p is not None and p.ok:
             was = link.status
             self.prev_ok[link.id] = True
@@ -682,6 +697,8 @@ class Orchestrator:
             link.error = "Iran server unreachable"
         elif p.active not in ("active",):
             link.error = f"service {p.active or 'missing'}"
+        elif self.stalled(p):
+            link.error = f"connected but turning users away: {p.dropped} in the last minute (queue full)"
         elif p.connected:
             link.error = "engine connected but probe failed"
         else:
@@ -710,6 +727,8 @@ class Orchestrator:
             if self.s.auto_adopt and time.time() - self.last_scan >= self.s.scan_interval:
                 await self.scan_all()
             await self.check_links()
+            await self.check_hosts()
+            await self.check_conflicts()
             await self.check_exits()
             await self.evaluate_domains()
             await self.release_handovers()
@@ -717,6 +736,120 @@ class Orchestrator:
             await self.check_propagation()
             self.last_check = time.time()
             await self.changed()
+
+    # ----------------------------------------------------------------- hosts
+    async def check_hosts(self) -> None:
+        """Each server's memory, load, OOM kills and BackPack version, every
+        host_interval. Reported only: no decision depends on it."""
+        if time.time() - self.last_hosts < max(60, self.s.host_interval):
+            return
+        self.last_hosts = time.time()
+
+        async def one(srv: Server):
+            try:
+                info = await self.driver.host(srv)
+            except (SSHError, OSError) as e:
+                log.info("host %s: %s", srv.name, e)
+                return
+            if info:
+                await self._update_host(srv, info)
+
+        try:
+            await asyncio.gather(*(one(s) for s in self.store.servers.values() if self.usable(s)))
+            await self.check_versions()
+        except Exception:  # only a view: it must never stop the monitor
+            log.exception("host check failed")
+
+    async def _update_host(self, srv: Server, info: dict[str, Any]) -> None:
+        kind = "داخل" if srv.role == IRAN else "خارج"
+        info = dict(info)
+        ooms = info.pop("ooms", [])
+        version = info.pop("version", "")
+        if version:
+            srv.backpack_version = version
+        srv.host = {**info, "at": round(time.time())}
+        known = {(o["ts"], o["pid"]) for o in srv.ooms}
+        new = sorted((o for o in ooms if (o["ts"], o["pid"]) not in known), key=lambda o: o["ts"])
+        cutoff = time.time() - 86400
+        srv.ooms = [o for o in srv.ooms + new if o["ts"] >= cutoff][-30:]
+        swap = srv.host.get("swap_total")
+        no_swap = "؛ این سرور swap ندارد" if swap == 0 else ""
+        if new:
+            what = "، ".join(f"{o['proc']} ({o['rss_mb']} MB)" if o.get("rss_mb") else o["proc"] for o in new[-5:])
+            last = fmt_dur(max(0, time.time() - new[-1]["ts"]))
+            await self.emit(
+                "error",
+                "memory",
+                f"رم سرور {kind} {srv.name} تمام شد و کرنل {len(new)} پروسه را بست: {what} (آخرین: {last} پیش){no_swap}. "
+                "وقتی backpack یا xray بسته شود همه کاربرهای آن قطع می‌شوند.",
+                server=srv.id,
+            )
+        key = f"mem:{srv.id}"
+        if srv.mem_low(self.s.mem_low_pct):
+            if key not in self.reported:
+                self.reported[key] = "low"
+                h = srv.host
+                await self.emit(
+                    "warning",
+                    "memory",
+                    f"رم آزاد سرور {kind} {srv.name} کم است: {h.get('mem_avail')} از {h.get('mem_total')} MB{no_swap}. "
+                    "اگر تمام شود، کرنل تانل یا Xray را می‌بندد.",
+                    server=srv.id,
+                )
+        elif self.reported.pop(key, None):
+            await self.emit("success", "memory", f"رم آزاد سرور {kind} {srv.name} دوباره کافی است", notify=False, server=srv.id)
+
+    async def check_versions(self) -> None:
+        """The two ends of a tunnel on different BackPack releases."""
+        seen = set()
+        for link in self.store.links.values():
+            if link.status == L_PENDING:
+                continue
+            key = f"ver:{link.id}"
+            gap = self.store.version_gap(link)
+            if gap:
+                seen.add(key)
+                said = f"{gap[0]}|{gap[1]}"
+                if self.reported.get(key) != said:
+                    self.reported[key] = said
+                    await self.emit(
+                        "warning",
+                        "version",
+                        f"نسخه BackPack دو سر تانل {self.link_label(link)} یکی نیست (داخل {gap[0]}، خارج {gap[1]}). "
+                        "هر بار وصل شدن چند ثانیه بیشتر طول می‌کشد و از v2.0.0 به بعد توکن تانل رمزنشده از مسیر رد می‌شود؛ هر دو سر را به یک نسخه برسانید.",
+                        link=link.id,
+                    )
+        for key in [k for k in self.reported if k.startswith("ver:") and k not in seen]:
+            del self.reported[key]
+            link = self.store.links.get(key[4:])
+            if link:
+                await self.emit("success", "version", f"نسخه BackPack دو سر تانل {self.link_label(link)} یکی شد", notify=False, link=link.id)
+
+    async def check_conflicts(self) -> None:
+        """Two tunnels on one Iran server listening on the same port."""
+        seen = set()
+        for c in self.store.port_conflicts():
+            a, b = (self.store.links[i] for i in c["links"])
+            key = f"clash:{a.id}:{b.id}"
+            seen.add(key)
+            ports = ", ".join(map(str, c["ports"][:8]))
+            if self.reported.get(key) == ports:
+                continue
+            self.reported[key] = ports
+            await self.emit(
+                "warning",
+                "ports",
+                f"دو تانل روی سرور داخل {self.name(a.iran_id)} پورت مشترک دارند ({ports}): {self.link_label(a)} و {self.link_label(b)}. "
+                "فقط یکی (هر کدام زودتر بالا بیاید) این پورت‌ها را می‌گیرد؛ دیگری روی آن‌ها کاربری نمی‌برد و اگر اولی گیر کند جایش را هم نمی‌گیرد. به هر تانل پورت جدا بدهید.",
+                link=a.id,
+                other=b.id,
+            )
+        for key in [k for k in self.reported if k.startswith("clash:") and k not in seen]:
+            del self.reported[key]
+            _, a_id, b_id = key.split(":")
+            a, b = self.store.links.get(a_id), self.store.links.get(b_id)
+            if a and b:
+                await self.emit("success", "ports", f"تداخل پورت بین {self.link_label(a)} و {self.link_label(b)} برطرف شد", notify=False, link=a.id)
 
     # ----------------------------------------------------------------- exits
     async def check_exits(self) -> None:
@@ -1219,10 +1352,26 @@ class Orchestrator:
             lines.append(f"<b>{title}</b>")
             for srv in st.by_role(role):
                 dot = "🟢" if srv.status == ONLINE else "🔴" if srv.status == OFFLINE else "⚪"
-                lines.append(f"{dot} {esc(srv.name)} <code>{esc(srv.ip)}</code>")
+                lines.append(f"{dot} {esc(srv.name)} <code>{esc(srv.ip)}</code>{esc(self.host_text(srv))}")
             lines.append("")
         lines.append(self.domains_text())
         return "\n".join(lines)
+
+    def host_text(self, srv: Server) -> str:
+        """" · RAM 1.2/5.8G · swap 0 · ⚠️ 2 OOM" for the status message."""
+        h = srv.host
+        if not h.get("mem_total"):
+            return ""
+        parts = [f"RAM {(h['mem_total'] - h.get('mem_avail', 0)) / 1024:.1f}/{h['mem_total'] / 1024:.1f}G"]
+        if h.get("swap_total") == 0:
+            parts.append("بدون swap")
+        if srv.mem_low(self.s.mem_low_pct):
+            parts.append("⚠️ رم کم")
+        if srv.ooms:
+            parts.append(f"⚠️ {len(srv.ooms)} OOM در ۲۴ ساعت")
+        if srv.backpack_version:
+            parts.append(srv.backpack_version)
+        return " · " + " · ".join(parts)
 
     def domains_text(self) -> str:
         st = self.store

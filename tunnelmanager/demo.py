@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 
 from .backpack import Driver, Found, Probe
 from .models import IRAN, KHAREJ, DNSProvider, Domain, Server
@@ -34,6 +35,8 @@ class SimNet(Driver):
         self.listen: dict[str, set[int]] = {}  # server id -> ports already in use
         self.fwd: dict[str, dict[int, dict]] = {}  # kharej id -> port -> where it is sent on
         self.ip_of: dict[str, str] = {}  # ip -> server id, so exits to a dead server fail
+        self.hosts: dict[str, dict] = {}  # server id -> what host() reports (backpack.parse_host)
+        self.drops: dict[str, int] = {}  # link id -> users turned away in the last minute
         self.calls: list[tuple] = []
         self.rnd = random.Random(1)
 
@@ -100,7 +103,9 @@ class SimNet(Driver):
         for x in links:
             ok = self.works(x)
             t = self.deployed.get(x.id) or x.transport
-            out[x.id] = Probe(ok=ok, active="active", latency_ms=self.lat(t, x) if ok else None, verified=bool(x.probe_port))
+            out[x.id] = Probe(
+                ok=ok, active="active", latency_ms=self.lat(t, x) if ok else None, verified=bool(x.probe_port), dropped=self.drops.get(x.id, 0)
+            )
         return out
 
     async def wait_up(self, link, iran, timeout):
@@ -116,6 +121,12 @@ class SimNet(Driver):
 
     async def listening(self, s):
         return set(self.listen.get(s.id, set()))
+
+    async def host(self, s):
+        if s.id in self.dead:
+            raise SSHError(f"{s.name} unreachable")
+        h = self.hosts.get(s.id, {})
+        return {**h, "ooms": [dict(o) for o in h.get("ooms", [])]} if h else {}
 
     async def exits(self, s, ports, targets):
         if s.id in self.dead:
@@ -215,6 +226,19 @@ def seed(store: Store, net: SimNet) -> None:
         net.ip_of = {s.ip: s.id for s in st.servers.values()}
         net.fwd[kh[0].id] = {443: {"method": "iptables", "targets": [f"{kh[2].ip}:443"], "via": "", "inferred": False}}
         net.fwd[kh[1].id] = {2083: {"method": "gost", "targets": ["203.0.113.50:2083"], "via": "gost", "inferred": False}}
+        rnd = random.Random(3)
+        for s in st.servers.values():
+            total = 5900 if s.role == IRAN else 3900
+            net.hosts[s.id] = {
+                "cpus": 4 if s.role == IRAN else 2, "load": [round(rnd.uniform(0.3, 2.5), 2)] * 3,
+                "mem_total": total, "mem_avail": round(total * rnd.uniform(0.35, 0.7)),
+                "swap_total": 4096, "swap_free": 3900, "version": "v2.0.0", "ooms": [],
+            }
+        # a kharej short of memory, with no swap and still on the older release
+        net.hosts[kh[2].id].update(
+            mem_avail=240, swap_total=0, swap_free=0, version="v1.8.5",
+            ooms=[{"ts": int(time.time()) - 5400, "pid": 4242, "proc": "backpack", "rss_mb": 2380}],
+        )
 
 
 async def chaos(orch, net: SimNet) -> None:

@@ -241,6 +241,49 @@ class Store:
                     out.setdefault(p, x)
         return out
 
+    def port_conflicts(self, iran_id: str | None = None) -> list[dict[str, Any]]:
+        """Tunnels on one Iran server told to listen on the same port. Only one
+        of them gets it (whichever engine starts first); the other carries no
+        users on it and cannot stand in for the first. Handed-over ports are
+        not a clash: the link that gave them up no longer lists them."""
+        out: list[dict[str, Any]] = []
+        built = [x for x in self.links.values() if x.status != L_PENDING and (iran_id is None or x.iran_id == iran_id)]
+        built.sort(key=lambda x: x.id)
+        wants = {x.id: listen_ports(self.link_ports(x)) for x in built}
+        for i, a in enumerate(built):
+            for b in built[i + 1 :]:
+                if a.iran_id != b.iran_id:
+                    continue
+                both = wants[a.id] & wants[b.id]
+                if both:
+                    out.append({"iran_id": a.iran_id, "links": [a.id, b.id], "ports": sorted(both)[:20]})
+        return out
+
+    def clashes(self, iran_id: str, ports: list[str], skip: set[str]) -> dict[str, list[int]]:
+        """Which built links on this Iran server already listen on any of these
+        ports (link id -> the shared ports), leaving out the ids in skip."""
+        want = listen_ports(ports)
+        out: dict[str, list[int]] = {}
+        for x in self.links.values():
+            if x.iran_id != iran_id or x.id in skip or x.status == L_PENDING:
+                continue
+            both = want & listen_ports(self.link_ports(x))
+            if both:
+                out[x.id] = sorted(both)[:20]
+        return out
+
+    def version_gap(self, link: Link) -> tuple[str, str] | None:
+        """(iran version, kharej version) when the two ends run different
+        BackPack releases. Since v2.0.0 a newer end first tries a handshake an
+        older one refuses, so every reconnect takes 8-16 s longer, and the
+        token then crosses the wire in the clear."""
+        iran, kharej = self.servers.get(link.iran_id), self.servers.get(link.kharej_id)
+        vi = iran.backpack_version if iran else ""
+        vk = kharej.backpack_version if kharej else ""
+        if vi and vk and vi != vk and "MISSING" not in (vi, vk):
+            return vi, vk
+        return None
+
     def owner(self, iran_id: str, spec: str) -> Link | None:
         """The link whose own port list holds this port (handover or not)."""
         port = first_port(spec)
@@ -349,9 +392,17 @@ class Store:
 
     def snapshot(self) -> dict[str, Any]:
         """What the dashboard renders. Secrets are masked."""
+        clash: dict[str, list[dict[str, Any]]] = {}
+        for c in self.port_conflicts():
+            a, b = c["links"]
+            clash.setdefault(a, []).append({"with": b, "ports": c["ports"]})
+            clash.setdefault(b, []).append({"with": a, "ports": c["ports"]})
         links = []
         for x in self.links.values():
             d = x.to_dict()
+            d["conflicts"] = clash.get(x.id, [])
+            gap = self.version_gap(x)
+            d["version_gap"] = list(gap) if gap else []
             d.pop("iran_base", None)
             d.pop("kharej_base", None)
             d["token"] = ""
@@ -378,7 +429,7 @@ class Store:
             ]
             domains.append(dd)
         return {
-            "servers": [s.public() for s in self.servers.values()],
+            "servers": [{**s.public(), "mem_low": s.mem_low(self.settings.mem_low_pct)} for s in self.servers.values()],
             "links": links,
             "domains": domains,
             "providers": [p.public() for p in self.providers.values()],

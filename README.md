@@ -14,6 +14,7 @@
 - [شروع کار روی سرورهای لایو](#شروع-کار-روی-سرورهای-لایو)
 - [کلید API آروان و کلادفلر](#کلید-api-آروان-و-کلادفلر)
 - [منطق جابه‌جایی](#منطق-جابهجایی)
+- [هشدارهای سلامت](#هشدارهای-سلامت)
 - [خروجی نهایی پورت‌ها](#خروجی-نهایی-پورتها)
 - [بکاپ و بازگردانی](#بکاپ-و-بازگردانی)
 - [ربات تلگرام](#ربات-تلگرام)
@@ -28,6 +29,7 @@
 - **جابه‌جایی خودکار:** در قطعی یا ناپایداری، اول تانل دیگری روی همان سرور داخل امتحان می‌شود. بعد رکورد به سرور داخلی می‌رود که همه پورت‌ها را سالم دارد. بعد از ۱۰ دقیقه پایداری، ترافیک به سرور اصلی برمی‌گردد.
 - **تغییر پروتکل با یک کلیک:** مثلاً tcpmux به wsmux. همه پروتکل‌ها تست می‌شوند و نتیجه و تأخیرشان کنار هم دیده می‌شود.
 - **خروجی نهایی:** اگر پورتی از خارج به سرور دیگری فوروارد شود (iptables، socat، gost، رله و…)، در پنل دیده می‌شود.
+- **هشدارهای سلامت:** تانلی که وصل است ولی کاربرها را رد می‌کند، تمام شدن رم و OOM، نسخه‌های متفاوت BackPack در دو سر تانل، و دو تانل روی یک پورت. جزئیات در [هشدارهای سلامت](#هشدارهای-سلامت).
 - **حالت نظارت:** روشن است تا وقتی خودتان خاموشش کنید. در این حالت پنل فقط می‌بیند و گزارش می‌دهد.
 - **بکاپ شبانه:** ساعت ۳ بامداد، رمزدار، به تلگرام فرستاده می‌شود. بازگردانی از داخل پنل یا خط فرمان انجام می‌شود.
 
@@ -119,6 +121,20 @@ sudo bash deploy/https.sh panel.example.com you@example.com
 
 > **سلامت چطور سنجیده می‌شود؟** هر تانلی که پنل می‌سازد یا بازنویسی می‌کند، یک پورت پروب فقط-لوکال روی سرور داخل دارد که به SSH سرور خارج می‌رسد. پنل از داخل تانل بنر SSH را می‌خواند، یعنی کل مسیر واقعاً کار می‌کند. تانل‌های موجود تا اولین بازنویسی از گزارش خود BackPack و اتصال‌های برقرار سنجیده می‌شوند.
 
+## هشدارهای سلامت
+
+«تانل وصل است» همیشه یعنی «کاربرها رد می‌شوند» نیست. پنل این‌ها را هم می‌بیند، روی بوم و جدول تانل‌ها نشان می‌دهد و در تلگرام خبر می‌دهد. هر هشدار یک بار فرستاده می‌شود و وقتی برطرف شد، در رویدادها ثبت می‌شود.
+
+| چه چیزی | از کجا | واکنش پنل |
+|---|---|---|
+| **تانل کاربرها را رد می‌کند** | خطوط `the queue is full, dropping a client` در لاگ سرویس تانل روی سرور داخل، در یک دقیقه اخیر | از ۲۰ اتصال ردشده در دقیقه به بالا، تانل مثل تانل قطع حساب می‌شود. در بازسازی خودکار، اول همان پروتکل دوباره راه‌اندازی می‌شود (کاری که ری‌استارت دستی می‌کرد). |
+| **رم تمام شد (OOM)** | `Killed process` در لاگ کرنل هر سرور | هشدار با اسم پروسه و رمی که گرفته بود، مثلاً `backpack (3035 MB)`. اگر سرور swap ندارد، گفته می‌شود. |
+| **رم کم** | `/proc/meminfo` | زیر ۱۰٪ رم آزاد، وقتی swap ندارد یا پر است. |
+| **نسخه‌های BackPack فرق دارد** | `backpack -v` روی دو سر هر تانل | از v2.0.0 به بعد، اگر دو سر هم‌نسخه نباشند، هر وصل شدن چند ثانیه بیشتر طول می‌کشد و توکن رمزنشده رد می‌شود. |
+| **دو تانل روی یک پورت** | پورت‌های تانل‌های هر سرور داخل | فقط یکی از دو تانل پورت را می‌گیرد و دیگری روی آن کاربری نمی‌برد. پنل در ویرایش پورت هم جلوی این حالت را می‌گیرد. |
+
+رم، swap، بار پردازنده، OOMها و نسخه BackPack هر سرور هر ۵ دقیقه خوانده و در کارت و جزئیات سرور نشان داده می‌شوند. آستانه‌ها در تنظیمات قابل تغییرند. این بررسی‌ها فقط می‌خوانند و چیزی را روی سرور عوض نمی‌کنند.
+
 ## خروجی نهایی پورت‌ها
 
 بعضی پورت‌ها بعد از رسیدن به سرور خارج به سرور دیگری فرستاده می‌شوند تا آی‌پی خروجی فرق کند. پنل هر دقیقه روی هر خارج **فقط می‌خواند** که با هر پورت چه می‌شود:
@@ -191,6 +207,7 @@ cd ~/TunnelManager && git pull && sudo bash deploy/install.sh
 - تانل‌هایی که پنل می‌سازد `tm-<id>` نام دارند و تانل‌های موجود اسم خودشان را نگه می‌دارند. ساختار فایل‌ها همان ساختار BackPack است: کانفیگ در `/etc/backpack/<name>.toml` و سرویس `backpack-<name>.service`.
 - در بازنویسی یک تانل موجود فقط پروتکل، توکن، پورت‌ها و پورت پروب عوض می‌شوند. بقیه کلیدها مثل `mux_*` و `bind_addr` اختصاصی دست نمی‌خورند.
 - «فراموش کردن» یک تانل فقط آن را از پنل حذف می‌کند و تانل روی سرور می‌ماند.
+- پنل BackPack را فقط وقتی نصب می‌کند که فهرست هش‌های ریلیز (`SHA256SUMS`) با کلید ناشر BackPack برای همان نسخه امضا شده باشد. اگر ریلیزی امضای معتبر نداشته باشد، نصب نمی‌شود. در آن صورت فایل `backpack_linux_<arch>.tar.gz` را خودتان با هش ریلیز چک کنید و در `/var/lib/tunnelmanager/cache/latest/` بگذارید (اگر در تنظیمات نسخه مشخصی مثل `v2.0.0` داده‌اید، به‌جای `latest` همان را بنویسید).
 
 ### دمو و توسعه
 
@@ -215,7 +232,9 @@ TunnelManager is a web panel for [BackPack](https://github.com/AminMGMT/BackPack
 - **Discovery:** adopts tunnels already running on your servers.
 - **Health:** checks every tunnel end to end.
 - **Failover:** when a tunnel breaks or flaps, the panel first moves the port to another tunnel on the same Iran server. Failing that, it points the domain's A record (ArvanCloud or Cloudflare) at an Iran server that serves all of the domain's ports. Traffic fails back after 10 minutes of stability.
+- **Health warnings:** a tunnel that is connected but turning users away (BackPack's "queue is full"), memory running out and OOM kills, the two ends on different BackPack releases, and two tunnels on one Iran server claiming the same port. A tunnel that keeps turning users away counts as down.
 - **Final exits:** shows (read-only) where each port finally exits when a kharej forwards it on.
 - **Backups:** sends an encrypted full backup to Telegram every night, with restore from the panel or the CLI.
 - **HTTPS:** `deploy/https.sh <domain>` serves the panel on 443 with a Let's Encrypt certificate.
+- **Verified installs:** BackPack is installed only from a release whose checksum list carries the publisher's signature for that tag.
 - **Safety:** it starts in observe-only mode, so nothing changes on live servers until you switch it off.

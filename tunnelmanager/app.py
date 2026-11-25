@@ -311,6 +311,19 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         if lid in orch.busy:
             raise HTTPException(409, "عملیات دیگری روی این تانل در جریان است")
 
+    def related(link_id: str) -> set[str]:
+        """A link and the ones its ports are handed over to or from."""
+        return {link_id, store.carrier(link_id)} | {s for s in store.handover if store.carrier(s) == link_id}
+
+    def clash_text(iran_id: str, ports: list[str], link_id: str = "") -> str:
+        """Why these ports cannot go on this Iran server ("" if they can): a
+        port listened on by two tunnels is only ever bound by one of them."""
+        clash = store.clashes(iran_id, ports, related(link_id) if link_id else set())
+        if not clash:
+            return ""
+        other_id, shared = next(iter(clash.items()))
+        return f"پورت {', '.join(map(str, shared[:8]))} روی {orch.name(iran_id)} را تانل {orch.link_label(store.links[other_id])} گرفته است؛ هر تانل پورت جدا لازم دارد"
+
     # ---- auth --------------------------------------------------------
     @app.get("/api/session")
     async def session(request: Request):
@@ -499,6 +512,9 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
             raise HTTPException(400, "iran_id must be an Iran server and kharej_id a kharej server")
         if body.transport and body.transport not in ALL_TRANSPORTS:
             raise HTTPException(400, "unknown transport")
+        why = clash_text(iran.id, body.ports)
+        if why:
+            raise HTTPException(409, why)
         link = Link(iran_id=iran.id, kharej_id=kharej.id, tunnel_port=store.free_port(iran.id, store.settings.tunnel_port_base))
         link.probe_port = store.free_port(iran.id, store.settings.probe_port_base)
         link.ports, link.label = body.ports, body.label
@@ -514,6 +530,10 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
     async def edit_link(lid: str, body: LinkIn):
         link = get(store.links, lid)
         busy_guard(lid)
+        if body.ports is not None and body.ports != link.ports:
+            why = clash_text(link.iran_id, body.ports, link.id)
+            if why:
+                raise HTTPException(409, why)
         before = (list(link.ports), link.accept_udp)
         for k in ("ports", "accept_udp", "label", "priority", "allowed", "pinned"):
             v = getattr(body, k)
@@ -523,6 +543,9 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         if body.apply_to_kharej and body.ports is not None:
             for other in store.links.values():
                 if other.kharej_id == link.kharej_id and other.id != link.id and other.ports != link.ports:
+                    # never onto a server where another tunnel already has them
+                    if other.iran_id == link.iran_id or clash_text(other.iran_id, link.ports, other.id):
+                        continue
                     other.ports = list(link.ports)
                     targets.append(other)
         await orch.changed()
@@ -706,6 +729,9 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         new.flap_window = max(60, int(new.flap_window))
         new.flap_count = max(2, int(new.flap_count))
         new.scan_interval = max(60, int(new.scan_interval))
+        new.host_interval = max(60, int(new.host_interval))
+        new.stall_drops = max(0, int(new.stall_drops))
+        new.mem_low_pct = min(50, max(1, int(new.mem_low_pct)))
         new.backup_password = keep_secret(body.get("backup_password"), store.settings.backup_password)
         new.backup_keep = min(100, max(1, int(new.backup_keep)))
         if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", str(new.backup_time).strip()):

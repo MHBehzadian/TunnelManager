@@ -90,6 +90,32 @@ function activeLinkIds() {
   for (const d of S.domains) for (const r of d.routes || []) if (r.link_id) set.add(r.link_id);
   return set;
 }
+/* what a server has left, and what is wrong with a tunnel besides up/down */
+const gb = (mb) => (mb / 1024).toFixed(1);
+function memText(s) {
+  const h = s.host || {};
+  return h.mem_total ? `${gb(h.mem_total - (h.mem_avail ?? 0))}/${gb(h.mem_total)}G` : "";
+}
+const recentOoms = (s) => (s.ooms || []).filter((o) => nowS() - o.ts < 86400);
+const oomLine = (o) => `${clock(o.ts)} · ${o.proc}${o.rss_mb ? ` · ${o.rss_mb} MB` : ""}`;
+function linkIssues(l) {
+  const out = [];
+  if (l.dropped > 0) {
+    const lim = S.settings.stall_drops;
+    const bad = lim > 0 && l.dropped >= lim;
+    out.push({ cls: bad ? "bad" : "warn", short: bad ? "کاربر رد می‌کند" : `${l.dropped} رد`,
+      text: `${l.dropped} اتصال کاربر در یک دقیقه اخیر رد شد (صف سرور داخل پر بود)` });
+  }
+  if ((l.version_gap || []).length) out.push({ cls: "warn", short: "نسخه‌ها فرق دارد",
+    text: `BackPack داخل ${l.version_gap[0]} و خارج ${l.version_gap[1]} است: هر وصل شدن کندتر است و توکن رمزنشده رد می‌شود` });
+  for (const c of l.conflicts || []) {
+    const o = linkById(c.with);
+    out.push({ cls: "bad", short: "تداخل پورت", text: `پورت ${c.ports.join(", ")} را ${o ? linkName(o) : "تانل دیگری"} روی همین سرور داخل هم دارد؛ فقط یکی از دو تانل آن را می‌گیرد` });
+  }
+  return out;
+}
+const issueChips = (l) => linkIssues(l).map((i) => `<span class="chip ${i.cls}" title="${esc(i.text)}">${esc(i.short)}</span>`).join(" ");
+
 function ago(ts) {
   if (!ts) return "—";
   const s = Math.max(0, Math.round(nowS() - ts));
@@ -286,6 +312,10 @@ function serverCard(s) {
   const up = links.filter((l) => l.status === "up").length;
   const meta = [`<span class="chip">${up}/${links.length} تانل</span>`];
   if (s.ssh_latency_ms != null) meta.push(`<span class="chip mono" title="تأخیر SSH از پنل">ssh ${ms(s.ssh_latency_ms)}</span>`);
+  const mem = memText(s);
+  if (mem) meta.push(`<span class="chip mono ${s.mem_low ? "bad" : ""}" title="رم مصرف‌شده از کل${s.host.swap_total === 0 ? " · بدون swap" : ""}">RAM ${mem}</span>`);
+  const oo = recentOoms(s);
+  if (oo.length) meta.push(`<span class="chip bad" title="${esc(`رم تمام شد و کرنل این‌ها را بست:\n${oo.map(oomLine).join("\n")}`)}">OOM ×${oo.length}</span>`);
   const ex = s.role === "kharej" ? serverExits(s.id) : [];
   if (ex.length) meta.push(`<span class="chip ${ex.some(exitBad) ? "bad" : ""}" title="${esc(ex.map((e) => `${e.port} → ${exitText(e)} (${e.method})`).join("\n"))}">↪ ${ex.length} پورت به بیرون</span>`);
   if (s.role === "iran") {
@@ -661,7 +691,7 @@ function linkTip(l) {
   return `<b>${esc(linkName(l))}</b>${esc(linkTag(l))}<br>وضعیت: ${FA[lstatus(l)] || l.status}${isFlapping(l) ? " — <span style='color:var(--degraded)'>مدام قطع و وصل</span>" : ""}<br>
     پروتکل: <span class="mono">${esc(l.transport || "—")}</span>${l.pinned ? " (قفل)" : ""} · تأخیر: <span class="mono">${ms(l.latency_ms)}</span><br>
     پورت‌ها: <span class="mono">${esc((l.exposed || []).join(", ") || "—")}</span>
-    ${l.error ? `<br><span style="color:var(--down)">${esc(l.error)}</span>` : ""}${best ? `<br><span class="muted">بهترین‌ها: ${esc(best)}</span>` : ""}`;
+    ${l.error ? `<br><span style="color:var(--down)">${esc(l.error)}</span>` : ""}${linkIssues(l).map((i) => `<br><span style="color:var(--${i.cls === "bad" ? "down" : "degraded"})">${esc(i.text)}</span>`).join("")}${best ? `<br><span class="muted">بهترین‌ها: ${esc(best)}</span>` : ""}`;
 }
 
 /* --------------------------------------------------------- tunnels table */
@@ -681,6 +711,7 @@ function renderTable() {
       if (active.has(l.id)) tags.push(`<span class="act">● ترافیک</span>`);
       if (handedOver(l)) tags.push(`<span class="chip purple">پورت‌ها روی ${esc(linkName(linkById(S.handover[l.id])))}</span>`);
       if (isFlapping(l)) tags.push(`<span class="chip warn">ناپایدار</span>`);
+      tags.push(issueChips(l));
       return `<tr data-link="${l.id}"><td><span class="dot ${st}"></span></td>
         <td class="pair">${esc(linkName(l))} ${tags.join(" ")}</td>
         <td class="muted">${esc(l.label || "")}</td>
@@ -780,6 +811,7 @@ function linkDrawer() {
     <dt>سنجش سلامت</dt><dd>${l.probe_port ? `پروب کامل مسیر <span class="mono muted">127.0.0.1:${l.probe_port}</span>` : "از روی اتصال تانل (پروب کامل با اولین بازنویسی کانفیگ اضافه می‌شود)"}</dd>
     <dt>دامنه‌ها</dt><dd>${doms.map((d) => `<span class="chip">${esc(d.fqdn)}</span>`).join(" ") || "<span class='muted'>— رزرو</span>"}</dd>
     ${l.error ? `<dt>خطا</dt><dd style="color:var(--down)">${esc(l.error)}</dd>` : ""}
+    ${linkIssues(l).length ? `<dt>هشدار</dt><dd>${linkIssues(l).map((i) => `<div><span class="chip ${i.cls}">${esc(i.short)}</span> <span class="small">${esc(i.text)}</span></div>`).join("")}</dd>` : ""}
   </dl>${spark(l.history, 430, 40)}</div>
   ${handBox}
   <div class="box"><h4>پورت‌های فورواردی — سمت سرور داخل (${esc(nm(l.iran_id))})</h4>
@@ -822,12 +854,17 @@ function serverDrawer() {
   };
   const built = links.filter((l) => l.status !== "pending"), offers = links.filter((l) => l.status === "pending");
   const broken = built.filter((l) => l.status !== "up");
+  const h = s.host || {}, oo = recentOoms(s);
   return `${head(esc(s.name), `<span class="mono">${esc(s.ip)}</span> · سرور ${s.role === "iran" ? "داخل" : "خارج"}`, s.status)}
   <div class="box"><h4>جزئیات</h4><dl class="kv">
     <dt>SSH</dt><dd class="mono">${esc(s.ssh_user)}@${esc(s.ip)}:${s.ssh_port}</dd>
     <dt>تأخیر SSH</dt><dd class="mono">${ms(s.ssh_latency_ms)}</dd>
     <dt>آخرین پاسخ</dt><dd>${ago(s.last_seen)}</dd>
     <dt>BackPack</dt><dd class="mono">${esc(s.backpack_version || "—")}</dd>
+    ${h.mem_total ? `<dt>رم</dt><dd><span class="mono">${gb(h.mem_total - (h.mem_avail ?? 0))}</span> از <span class="mono">${gb(h.mem_total)}</span> گیگ مصرف‌شده ${s.mem_low ? "<span class='chip bad'>کم</span>" : ""}</dd>
+    <dt>swap</dt><dd>${h.swap_total ? `<span class="mono">${gb(h.swap_total - (h.swap_free ?? 0))}</span> از <span class="mono">${gb(h.swap_total)}</span> گیگ` : "<span class='chip warn'>ندارد</span>"}</dd>
+    <dt>بار پردازنده</dt><dd><span class="mono" dir="ltr">${esc((h.load || []).join(" "))}</span>${h.cpus ? ` <span class="muted">(${h.cpus} هسته)</span>` : ""} <span class="muted small">· ${ago(h.at)}</span></dd>` : ""}
+    ${oo.length ? `<dt>OOM در ۲۴ ساعت</dt><dd>${oo.map((o) => `<div class="mono small">${esc(oomLine(o))}</div>`).join("")}<span class="hint">رم سرور تمام شد و کرنل این پروسه‌ها را بست؛ هر بار کاربرهای آن قطع شدند. swap اضافه کنید یا بار سرور را کم کنید.</span></dd>` : ""}
     <dt>آخرین جستجوی تانل</dt><dd>${ago(s.last_scan)}</dd>
     <dt>اولویت</dt><dd>${s.priority} ${s.enabled ? "" : "<span class='chip warn'>غیرفعال</span>"}</dd>
     ${s.error ? `<dt>خطا</dt><dd style="color:var(--down)">${esc(s.error)}</dd>` : ""}
@@ -1051,6 +1088,9 @@ function settingsForm() {
       <label>مهلت هر پروتکل در تست (ثانیه)<input name="test_timeout" type="number" min="5" value="${s.test_timeout}"></label></div>
       <div class="grid2"><label>«ناپایدار» = چند قطعی<input name="flap_count" type="number" min="2" value="${s.flap_count}"></label>
       <label>در چند دقیقه<input name="flap_window" type="number" min="1" value="${Math.round(s.flap_window / 60)}"></label></div>
+      <div class="grid2"><label>«کاربر رد می‌کند» = چند اتصال ردشده در دقیقه<input name="stall_drops" type="number" min="0" value="${s.stall_drops}"></label>
+      <label>هشدار رم کم زیر چند درصد آزاد<input name="mem_low_pct" type="number" min="1" max="50" value="${s.mem_low_pct}"></label></div>
+      <p class="hint">تانلی که وصل است ولی سرور داخل کاربرها را رد می‌کند (در لاگ BackPack: «the queue is full») مثل تانل قطع حساب می‌شود؛ ۰ یعنی خاموش. رم، swap، بار و OOM هر سرور هر <input name="host_interval" type="number" min="1" style="width:4em" value="${Math.round(s.host_interval / 60)}"> دقیقه خوانده می‌شود.</p>
       <label class="check"><input type="checkbox" name="auto_repair" ${s.auto_repair ? "checked" : ""}> بازسازی خودکار تانل‌های قطع با پروتکل‌های دیگر</label>
       <label>پروتکل‌هایی که تست می‌شوند</label>
       <div class="tchecks">${order.map((t) => `<label><input type="checkbox" name="tr" value="${t}" ${s.candidate_transports.includes(t) ? "checked" : ""}>${t}</label>`).join("")}</div>
@@ -1094,6 +1134,7 @@ function settingsForm() {
       observe_only: observe,
       check_interval: +f.get("check_interval"), fail_threshold: +f.get("fail_threshold"), test_timeout: +f.get("test_timeout"),
       failback_after: Math.round(+f.get("failback_after") * 60), flap_count: +f.get("flap_count"), flap_window: Math.round(+f.get("flap_window") * 60),
+      stall_drops: +f.get("stall_drops"), mem_low_pct: +f.get("mem_low_pct"), host_interval: Math.round(+f.get("host_interval") * 60),
       auto_repair: !!f.get("auto_repair"), auto_adopt: !!f.get("auto_adopt"), auto_mesh: !!f.get("auto_mesh"),
       scan_interval: Math.round(+f.get("scan_interval") * 60), candidate_transports: f.getAll("tr"),
       tunnel_port_base: +f.get("tunnel_port_base"), probe_port_base: +f.get("probe_port_base"),

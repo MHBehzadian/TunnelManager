@@ -79,6 +79,11 @@ class Server(Model):
     # "fails", "since"})
     exits: dict[str, dict[str, Any]] = field(default_factory=dict)
     exit_reach: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # what the server has left (backpack.parse_host), read every host_interval:
+    # cpus, load, mem_total, mem_avail, swap_total, swap_free (MB), at
+    host: dict[str, Any] = field(default_factory=dict)
+    # processes the kernel killed for lack of memory, last 24 hours
+    ooms: list[dict[str, Any]] = field(default_factory=list)
 
     def probe_addr(self) -> str:
         return self.probe_target or f"127.0.0.1:{self.ssh_port}"
@@ -88,6 +93,15 @@ class Server(Model):
         d["ssh_password"] = "••••" if self.ssh_password else ""
         d["ssh_key"] = "••••" if self.ssh_key else ""
         return d
+
+    def mem_low(self, pct: int) -> bool:
+        """Under pct% of memory available and swap (if any) nearly full."""
+        h = self.host
+        total, avail = h.get("mem_total"), h.get("mem_avail")
+        if not total or avail is None or avail * 100 >= total * pct:
+            return False
+        swap = h.get("swap_total") or 0
+        return not swap or (h.get("swap_free") or 0) * 5 < swap
 
 
 @dataclass
@@ -142,6 +156,7 @@ class Link(Model):
     fail_count: int = 0
     flaps: list[float] = field(default_factory=list)  # when a working link started failing
     verified: bool = True  # False when health could only be inferred (no probe)
+    dropped: int = 0  # users the Iran side turned away in the last minute (queue full)
     tests: dict[str, dict[str, Any]] = field(default_factory=dict)  # transport -> TestResult
     error: str = ""
     history: list[list[float]] = field(default_factory=list)  # [[ts, latency or -1], ...]
@@ -252,6 +267,9 @@ class Settings(Model):
     auto_adopt: bool = True  # import tunnels already running on the servers
     auto_mesh: bool = False  # offer a (not yet built) tunnel for pairs that have none
     scan_interval: int = 600
+    host_interval: int = 300  # seconds between reads of each server's memory, load and OOM kills
+    stall_drops: int = 20  # users turned away in a minute that make a connected tunnel count as failing
+    mem_low_pct: int = 10  # warn when available memory falls under this share (and swap is full or absent)
     install_backpack: bool = True  # push the binary to servers that lack it
     backpack_release: str = "latest"  # GitHub release tag, or "latest"
     doh_resolvers: list[str] = field(
