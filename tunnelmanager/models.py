@@ -230,6 +230,10 @@ class Telegram(Model):
     api_base: str = "https://api.telegram.org"  # a reverse proxy if Telegram is blocked
     proxy: str = ""  # http://... or socks5://...
     enabled: bool = True
+    # False: only send. Another program (the Nexra top-up bot) owns this
+    # token's updates and runs the commands through /api/bot/command, and two
+    # getUpdates loops on one token would steal each other's messages.
+    listen: bool = True
 
 
 @dataclass

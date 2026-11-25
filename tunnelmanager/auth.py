@@ -72,6 +72,19 @@ class Auth:
         ok_pass = hmac.compare_digest(_hash(password, bytes.fromhex(self.data["salt"])), self.data["hash"])
         return ok_user and ok_pass
 
+    # ---- API key: for programs (the Nexra top-up bot), not people -------
+    def api_key(self, rotate: bool = False) -> str:
+        self._reload()
+        if rotate or not self.data.get("api_key"):
+            self.data["api_key"] = secrets.token_urlsafe(32)
+            self._save()
+        return self.data["api_key"]
+
+    def check_key(self, key: str | None) -> bool:
+        self._reload()
+        want = self.data.get("api_key") or ""
+        return bool(key and want and hmac.compare_digest(key, want))
+
     def _sig(self, payload: str) -> str:
         return hmac.new(self.data["secret"].encode(), payload.encode(), hashlib.sha256).hexdigest()
 

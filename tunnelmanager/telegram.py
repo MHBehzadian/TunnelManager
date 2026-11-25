@@ -118,7 +118,7 @@ class TelegramBot:
     async def _poller(self) -> None:
         while True:
             cfg = self.get_cfg()
-            if not (cfg.enabled and cfg.bot_token):
+            if not (cfg.enabled and cfg.bot_token and cfg.listen):
                 await asyncio.sleep(5)
                 continue
             try:

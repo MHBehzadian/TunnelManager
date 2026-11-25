@@ -22,6 +22,8 @@ def main() -> None:
     pw = sub.add_parser("passwd", help="set the admin username/password")
     pw.add_argument("--username", default="admin")
     pw.add_argument("--password", help="non-interactive (for install scripts)")
+    ak = sub.add_parser("apikey", help="print the API key the Nexra top-up bot connects with")
+    ak.add_argument("--rotate", action="store_true", help="make a new key (the old one stops working)")
     bk = sub.add_parser("backup", help="write a full backup file")
     bk.add_argument("--out", help="file to write (default: <data>/backups/...)")
     bk.add_argument("--password", help="encrypt with this password (default: the one set in the panel)")
@@ -35,6 +37,12 @@ def main() -> None:
 
     if args.cmd in ("backup", "restore"):
         return backup_cli(args)
+
+    if args.cmd == "apikey":
+        from .auth import Auth
+
+        print(Auth(Path(args.data) / "auth.json").api_key(rotate=args.rotate))
+        return
 
     if args.cmd == "passwd":
         from .auth import Auth

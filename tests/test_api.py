@@ -90,3 +90,38 @@ def test_password_changed_from_cli_works_without_restart(tmp_path):
         Auth(tmp_path / "auth.json").set_password("admin", "second2")  # what `passwd` does
         assert c.post("/api/login", json={"username": "admin", "password": "first1"}).status_code == 401
         assert c.post("/api/login", json={"username": "admin", "password": "second2"}).status_code == 200
+
+
+def test_bot_api_key(tmp_path):
+    with client(tmp_path) as c:
+        c.post("/api/setup", json={"username": "admin", "password": "secret1"})
+        key = c.app.state.auth.api_key()
+        c.cookies.clear()
+        assert c.get("/api/bot/info").status_code == 401
+        assert c.get("/api/bot/info", headers={"X-API-Key": "wrong"}).status_code == 401
+        h = {"X-API-Key": key}
+        assert c.get("/api/bot/info", headers=h).json()["observe_only"] is True
+        assert c.get("/api/bot/info", headers={"Authorization": f"Bearer {key}"}).status_code == 200
+        # the key opens only the bot endpoints, not the panel
+        assert c.get("/api/state", headers=h).status_code == 401
+
+        r = c.post("/api/bot/command", headers=h, json={"cmd": "status"}).json()
+        assert isinstance(r["text"], str) and r["text"]
+        assert "خاموش" in c.post("/api/bot/command", headers=h, json={"cmd": "/observe", "args": ["off"]}).json()["text"]
+        assert c.app.state.store.settings.observe_only is False
+
+        sent = []
+
+        async def fake_test(cfg):
+            sent.append(cfg)
+
+        c.app.state.bot.test = fake_test
+        assert c.post("/api/bot/link", headers=h, json={"bot_token": "x", "chat_ids": ["1"]}).status_code == 400
+        r = c.post("/api/bot/link", headers=h, json={"bot_token": "123456:" + "a" * 35, "chat_ids": [111, "222"]})
+        assert r.json() == {"ok": True}
+        tg = c.app.state.store.settings.tg()
+        assert tg.listen is False and tg.chat_ids == ["111", "222"] and sent
+
+        # rotating the key locks the old one out
+        new = c.app.state.auth.api_key(rotate=True)
+        assert new != key and c.get("/api/bot/info", headers=h).status_code == 401

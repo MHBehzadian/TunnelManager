@@ -87,3 +87,10 @@ if [ "${CREATED:-0}" = 1 ]; then
   echo "  password: $PASS"
   echo "  (change it any time: $DEST/venv/bin/python -m tunnelmanager --data $DATA passwd)"
 fi
+KEY="$(cd "$DEST" && "$DEST/venv/bin/python" -m tunnelmanager --data "$DATA" apikey 2>/dev/null || true)"
+if [ -n "$KEY" ]; then
+  echo
+  echo "To run it from the Nexra top-up bot (⚙️ → 🛰 تانل‌ها → اتصال TunnelManager):"
+  echo "  address: http://$IP:$PORT"
+  echo "  API key: $KEY"
+fi

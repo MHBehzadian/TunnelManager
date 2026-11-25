@@ -270,6 +270,15 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
         if cmd == "/backup":
             r = await make_backup("manual")
             return "🗄 بکاپ فرستاده شد." if r["sent"] else f"بکاپ ساخته شد ولی ارسال نشد: {r['error']}"
+        if cmd == "/observe":
+            want = (args[0].lower() if args else "")
+            if want in ("on", "off"):
+                store.settings.observe_only = want == "on"
+                await orch.changed()
+                await orch.emit("info", "panel", "حالت نظارت " + ("روشن شد" if want == "on" else "خاموش شد؛ جابه‌جایی خودکار فعال است"), notify=False)
+            on = store.settings.observe_only
+            return ("👁 حالت نظارت <b>روشن</b> است: پنل فقط می‌بیند و گزارش می‌دهد." if on
+                    else "⚙️ حالت نظارت <b>خاموش</b> است: جابه‌جایی و بازسازی خودکار انجام می‌شود.")
         return await orch.bot_command(cmd, args)
 
     bot.handler = bot_command
@@ -300,6 +309,58 @@ def create_app(data_dir: str | Path | None = None, driver: Driver | None = None,
             raise HTTPException(401, "login required")
 
     A = [Depends(need_auth)]
+
+    def need_key(request: Request) -> None:
+        key = request.headers.get("x-api-key") or ""
+        if not key and request.headers.get("authorization", "").lower().startswith("bearer "):
+            key = request.headers["authorization"][7:].strip()
+        if not auth.check_key(key):
+            raise HTTPException(401, "bad api key")
+
+    K = [Depends(need_key)]
+
+    # ---- for the Nexra top-up bot (API key) --------------------------
+    @app.get("/api/bot/info", dependencies=K)
+    async def bot_info():
+        st = store.settings
+        return {"version": __version__, "observe_only": st.observe_only, "servers": len(store.servers),
+                "links": len(store.links), "domains": len(store.domains)}
+
+    @app.post("/api/bot/command", dependencies=K)
+    async def bot_cmd(body: dict):
+        cmd = str(body.get("cmd") or "").strip().split("@")[0].lower()
+        if not cmd.startswith("/"):
+            cmd = "/" + cmd
+        args = [str(a) for a in (body.get("args") or [])][:5]
+        try:
+            text = await bot_command(cmd, args)
+        except Exception as e:
+            log.exception("bot command %s failed", cmd)
+            raise HTTPException(500, str(e))
+        return {"text": text}
+
+    @app.post("/api/bot/link", dependencies=K)
+    async def bot_link(body: dict):
+        """Send alerts and backups through the caller's bot to its chats. The
+        caller keeps reading that bot's messages, so this panel stops polling."""
+        token = str(body.get("bot_token") or "").strip()
+        chats = [str(c).strip() for c in (body.get("chat_ids") or []) if str(c).strip()]
+        if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", token) or not chats:
+            raise HTTPException(400, "bot_token and chat_ids are required")
+        old = store.settings.tg()
+        tg = Telegram.from_dict({**old.to_dict(), "bot_token": token, "chat_ids": chats, "enabled": True, "listen": False})
+        if body.get("api_base"):
+            tg.api_base = str(body["api_base"]).strip()
+        if "proxy" in body:
+            tg.proxy = str(body.get("proxy") or "").strip()
+        new = Settings.from_dict({**store.settings.to_dict(), "telegram": tg.to_dict()})
+        store.settings = new
+        await orch.changed()
+        try:
+            await bot.test(tg)
+        except Exception as e:
+            return {"ok": True, "warning": f"ذخیره شد ولی پیام آزمایشی نرسید: {e}"}
+        return {"ok": True}
 
     def get(coll: dict, key: str):
         obj = coll.get(key)
